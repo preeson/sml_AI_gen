@@ -159,7 +159,8 @@ class BlockSpectrum:
 
 def analyse(fold: FoldedBlock, offset: float = 1540.0, detrend_order: int = 3,
             min_counts: float = 500.0,
-            noise_bins=(11, 12, 13, 14, 16, 17, 18, 19)) -> BlockSpectrum:
+            noise_offsets=(-4, -3, -2, -1, 1, 2, 3, 4),
+            k: int | None = None, exclude_bins=()) -> BlockSpectrum:
     """
     Convert a folded block to dR/R, detrend, and read off DFT bin 15.
 
@@ -168,9 +169,15 @@ def analyse(fold: FoldedBlock, offset: float = 1540.0, detrend_order: int = 3,
     min_counts : pixels whose block-mean is below offset + min_counts are
                  masked out.  Without this, vignetted / dental-cement pixels
                  divide by ~0 and produce enormous meaningless phases.
+    k          : which DFT bin to read.  Defaults to fold.n_cycles, the
+                 stimulus bin.  Pass a neighbouring bin to run the whole
+                 pipeline on a frequency where no stimulus exists -- that is
+                 the only control that needs no model of the noise.
+    exclude_bins : bins never used for the noise estimate (e.g. keep the
+                 stimulus bin out when analysing an off-bin control).
     """
     n_bins, h, w = fold.cycles.shape
-    k_stim = fold.n_cycles  # exactly, by construction
+    k_stim = fold.n_cycles if k is None else int(k)
 
     denom = fold.mean_image - offset
     mask = denom > min_counts
@@ -195,7 +202,9 @@ def analyse(fold: FoldedBlock, offset: float = 1540.0, detrend_order: int = 3,
     # MAGNITUDE over the neighbouring bins is sqrt(2) larger, so divide it
     # out.  With this convention, white noise of sd s over N frames gives
     # noise = s*sqrt(2/N), and the single-pixel phase error is ~1/snr radians.
-    nb = np.asarray(noise_bins)
+    ex = set(int(b) for b in exclude_bins) | {k_stim}
+    nb = np.asarray([k_stim + o for o in noise_offsets
+                     if 0 < k_stim + o < X.shape[0] and k_stim + o not in ex])
     noise = np.sqrt((np.abs(X[nb] * scale) ** 2).mean(axis=0) / 2.0)
 
     freqs = np.fft.rfftfreq(n_bins, 1.0 / fold.fs)

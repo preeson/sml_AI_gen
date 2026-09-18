@@ -81,16 +81,26 @@ def _basis(I, mask, order):
     return B, names
 
 
-def fit_common_mode(component, I, noise, mask, order: int = 0) -> LeakFit:
+def fit_common_mode(component, I, noise, mask, order: int = 0,
+                    fit_mask=None) -> LeakFit:
     """
     Weighted complex least squares of component ~ alpha/I + beta (+ poly).
 
     Weighting is 1/noise so that bright, low-noise pixels are not drowned out
     by the dim ones where the leak is loudest.
+
+    fit_mask : where to FIT (defaults to `mask`, where we evaluate).  Fitting
+        inside a narrow brightness band is ill-conditioned -- alpha/I and beta
+        are nearly collinear when 1/I barely varies.  Pass the full valid
+        field here and the bright band as `mask`: the 150x dynamic range of
+        the whole field separates the additive and multiplicative terms
+        properly, while the residual is still judged only on tissue.
     """
+    if fit_mask is None:
+        fit_mask = mask
     B, names = _basis(I, mask, order)
     y = component.ravel()
-    m = mask.ravel() & np.isfinite(y) & np.isfinite(B).all(axis=1)
+    m = fit_mask.ravel() & np.isfinite(y) & np.isfinite(B).all(axis=1)
     wgt = 1.0 / np.where(noise.ravel() > 0, noise.ravel(), np.inf)
 
     A = B[m] * wgt[m, None]
@@ -107,9 +117,10 @@ def fit_common_mode(component, I, noise, mask, order: int = 0) -> LeakFit:
                    order=order)
 
 
-def remove_common_mode(sp, I, mask, order: int = 0):
+def remove_common_mode(sp, I, mask, order: int = 0, fit_mask=None):
     """Return (ResidualSpectrum, LeakFit) for one block."""
-    fit = fit_common_mode(sp.component, I, sp.noise, mask, order=order)
+    fit = fit_common_mode(sp.component, I, sp.noise, mask, order=order,
+                          fit_mask=fit_mask)
     resid = sp.component - fit.predicted
     amp = np.abs(resid)
     with np.errstate(invalid="ignore", divide="ignore"):
