@@ -30,7 +30,7 @@ import scipy.io as sio
 # Configuration -- edit these paths for your machine
 # --------------------------------------------------------------------------
 
-DATA_DIR = r"C:\Users\gbouvier\Desktop\09-Sep-2026"
+DATA_DIR = r"/mnt/user-data/uploads"
 
 DAT_PATH = os.path.join(DATA_DIR, "Frames_1_640_540_uint16_0001.dat")
 FRAMETIMES_PATH = os.path.join(DATA_DIR, "frameTimes_0001.mat")
@@ -194,6 +194,8 @@ class StimBlock:
     t1: float = 0.0
     bar_deg_first: float = 0.0   # bar CENTRE at the first frame of a cycle
     bar_deg_last: float = 0.0    # bar CENTRE at the last frame of a cycle
+    visible_half: float = 0.0    # half-extent of the SCREEN along this axis,
+                                 # in degrees, from the monitor geometry
 
     @property
     def n_cam_frames(self) -> int:
@@ -220,8 +222,30 @@ class StimLog:
     blocks: list = field(default_factory=list)
     sweep_width: float = 0.0
     step_width: float = 0.0
+    visible_half: dict = field(default_factory=dict)  # axis -> half-extent deg
     nominal_refresh: float = 60.0
     effective_refresh: float = 0.0
+
+    @property
+    def travel_vs_visible(self) -> str:
+        """One line per axis: does the bar travel exceed the visible screen?
+
+        When it does, a pixel's preferred position spans more than one full
+        cycle of the forward-minus-reverse phase difference, so the textbook
+        half-difference aliases.  ioi_maps.combine_axis avoids that; this is
+        here so the condition is visible rather than assumed.
+        """
+        out = []
+        for ax in ("elevation", "azimuth"):
+            bs = [b for b in self.blocks if b.axis == ax]
+            if not bs:
+                continue
+            tr = abs(bs[0].bar_deg_last - bs[0].bar_deg_first)
+            vis = 2 * bs[0].visible_half
+            out.append(f"{ax}: bar travel {tr:.1f} deg vs visible screen "
+                       f"{vis:.1f} deg -> half-difference "
+                       f"{'ALIASES' if tr > vis else 'is safe'}")
+        return "\n".join(out)
 
     def by_label(self, label: str) -> StimBlock:
         for b in self.blocks:
@@ -258,6 +282,17 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None) -> Stim
     n_stim = len(frames)
 
     sweep_table = stim["sweep_table"]  # (direction, start_deg, end_deg)
+
+    # Half-extent of the screen along each axis, straight from the monitor's
+    # own warped coordinate grid.  Reading this from the log rather than
+    # hard-coding it means the value can never disagree with the stimulus that
+    # was actually presented -- viewing distance and screen size change
+    # between sessions, and a stale constant fails silently.
+    mon = d["monitor"]
+    visible_half = {
+        "azimuth": float(np.abs(mon["deg_coord_x"]).max()),
+        "elevation": float(np.abs(mon["deg_coord_y"]).max()),
+    }
 
     # camera frames per stimulus frame
     span = ft.post_stim - ft.pre_stim
@@ -296,6 +331,7 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None) -> Stim
             t1=float(ft.t[min(cam1, ft.n_frames - 1)]),
             bar_deg_first=float(rows[0][1] + rows[0][2]) / 2.0,
             bar_deg_last=float(rows[-1][1] + rows[-1][2]) / 2.0,
+            visible_half=visible_half[_AXIS_OF.get(str(label), "azimuth")],
         ))
 
     log = StimLog(
@@ -304,6 +340,7 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None) -> Stim
         blocks=blocks,
         sweep_width=float(stim["sweep_width"]),
         step_width=float(stim["step_width"]),
+        visible_half=visible_half,
         nominal_refresh=float(d["monitor"]["refresh_rate"]),
     )
     total = ft.t[min(ft.post_stim, ft.n_frames - 1)] - ft.t[ft.pre_stim]

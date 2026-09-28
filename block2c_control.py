@@ -73,7 +73,9 @@ K_STIM = 15
 K_LIST = [11, 12, 13, 14, 15, 16, 17, 18, 19]
 LABELS = ["B2U", "U2B", "L2R", "R2L"]
 PAIRS = [("elevation", "B2U", "U2B"), ("azimuth", "L2R", "R2L")]
-VIS_HALF = {"elevation": 33.4, "azimuth": 49.7}
+# Screen half-extents come from the stimulus log (see ioi_core), never from a
+# constant here -- they change with viewing distance and a stale value fails
+# silently.  They are carried in the cache alongside the components.
 
 CACHE = "components_bins.npz"
 OUT_PNG = "block2c_control.png"
@@ -83,7 +85,13 @@ def reduce_all_bins():
     if os.path.exists(CACHE):
         print(f"loading cached multi-bin reduction from {CACHE}")
         z = np.load(CACHE, allow_pickle=True)
-        return {k: z[k] for k in z.files}
+        d = {k: z[k] for k in z.files}
+        missing = [f"{l}_vishalf" for l in LABELS if f"{l}_vishalf" not in d]
+        if missing:
+            print(f"  cache predates the screen-extent change "
+                  f"({len(missing)} keys missing) -- redoing the reduction")
+        else:
+            return d
 
     ft = ioi.load_frame_times()
     log = ioi.load_stim_log(ft=ft)
@@ -104,6 +112,7 @@ def reduce_all_bins():
             out[f"{blk.label}_duration"] = np.array(blk.duration)
             out[f"{blk.label}_p0"] = np.array(blk.bar_deg_first)
             out[f"{blk.label}_p1"] = np.array(blk.bar_deg_last)
+            out[f"{blk.label}_vishalf"] = np.array(blk.visible_half)
             del fold
     print(f"  reduction took {time.time()-t0:.0f} s")
     np.savez_compressed(CACHE, **out)
@@ -129,6 +138,7 @@ def _blk(label, d, k):
         t0=0.0, t1=dur,
         bar_deg_first=float(d[f"{label}_p0"]),
         bar_deg_last=float(d[f"{label}_p1"]),
+        visible_half=float(d[f"{label}_vishalf"]),
     )
 
 
@@ -152,9 +162,9 @@ def metrics_for_bin(d, k, bright, valid, I):
         am = iom.combine_axis(resid[f], _blk(f, d, k), resid[rv],
                               _blk(rv, d, k), phase_sigma=PHASE_SIGMA,
                               delay_sigma=DELAY_SIGMA, snr_min=0.0,
-                              visible_half=VIS_HALF[axis])
+                              visible_half=float(d[f"{f}_vishalf"]))
         am.mask = bright
-        lim = VIS_HALF[axis]
+        lim = am.visible / 2.0
         axes[axis] = dict(
             delay=float(np.nanmedian(am.delay[bright])),
             delay_chance=am.period / 4.0,
@@ -306,7 +316,7 @@ def _figure(results, d, I, bright):
     a.set_xlabel("DFT bin"); a.set_ylabel("median delay (s)")
     a.legend(fontsize=8); a.set_title("delay per bin (dotted = chance)")
 
-    lim = VIS_HALF["elevation"]
+    lim = results[K_STIM][1]["elevation"]["maps"].visible / 2.0
     for j, k in enumerate((K_STIM - 2, K_STIM)):
         a = ax[1, 1 + j]
         am = results[k][1]["elevation"]["maps"]

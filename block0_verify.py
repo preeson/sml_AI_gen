@@ -73,15 +73,21 @@ def main():
           f"(from the camera clock)")
     print(f"  sweep width {log.sweep_width:.1f} deg, "
           f"step {log.step_width:.4f} deg")
+    print(f"  screen half-extent (from the monitor geometry in the log): "
+          f"azimuth +-{log.visible_half['azimuth']:.2f} deg, "
+          f"elevation +-{log.visible_half['elevation']:.2f} deg")
+    for line in log.travel_vs_visible.split("\n"):
+        print(f"  {line}")
     print()
     hdr = (f"  {'blk':<5}{'axis':<11}{'cam frames':<20}{'dur (s)':>9}"
-           f"{'cyc':>5}{'F (Hz)':>10}{'bar centre (deg)':>22}")
+           f"{'cyc':>5}{'F (Hz)':>10}{'bar centre (deg)':>22}{'screen':>9}")
     print(hdr)
     for b in log.blocks:
         print(f"  {b.label:<5}{b.axis:<11}"
               f"{f'{b.cam0}-{b.cam1}':<20}{b.duration:9.2f}"
               f"{b.n_cycles:5d}{b.f_stim:10.6f}"
-              f"{f'{b.bar_deg_first:+.1f} -> {b.bar_deg_last:+.1f}':>22}")
+              f"{f'{b.bar_deg_first:+.1f} -> {b.bar_deg_last:+.1f}':>22}"
+              f"{f'+-{b.visible_half:.1f}':>9}")
 
     # contiguity / containment
     ok = True

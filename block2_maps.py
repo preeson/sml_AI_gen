@@ -39,8 +39,10 @@ PHASE_SIGMA = 2.0      # ~181 um FWHM at 4x binning
 DELAY_SIGMA = 4.0      # ~362 um FWHM
 SNR_MIN = 2.0
 
-# screen half-extents, from the monitor geometry (33 x 60 cm at 25 cm)
-VIS_HALF = {"elevation": 33.4, "azimuth": 49.7}
+# Screen half-extents are NOT hard-coded: they come from the monitor's warped
+# coordinate grid in the stimulus log, so they can never disagree with the
+# stimulus that was actually presented.  Viewing distance and screen size
+# change between sessions and a stale constant fails silently.
 
 PAIRS = [("elevation", "B2U", "U2B"), ("azimuth", "L2R", "R2L")]
 UM_PER_PIXEL = 6150.0 / 640.0 * BIN_XY   # 9.609 um * BIN_XY
@@ -53,6 +55,7 @@ OUT_NPZ = "maps.npz"
 def main():
     ft = ioi.load_frame_times()
     log = ioi.load_stim_log(ft=ft)
+    print(log.travel_vs_visible)
 
     specs, blocks = {}, {}
     t0 = time.time()
@@ -83,7 +86,8 @@ def main():
     for axis, fwd, rev in PAIRS:
         am = iom.combine_axis(specs[fwd], blocks[fwd], specs[rev], blocks[rev],
                               phase_sigma=PHASE_SIGMA, delay_sigma=DELAY_SIGMA,
-                              snr_min=SNR_MIN, visible_half=VIS_HALF[axis])
+                              snr_min=SNR_MIN,
+                              visible_half=blocks[fwd].visible_half)
         maps[axis] = am
         print("\n" + iom.report(am))
 
@@ -131,7 +135,7 @@ def _figure(maps, specs):
 
     for j, (axis, am) in enumerate(maps.items()):
         m = am.mask
-        lim = VIS_HALF[axis]
+        lim = am.visible / 2.0
 
         a = ax[0, j]
         im = a.imshow(np.where(m, am.position, np.nan), cmap="jet",
@@ -172,10 +176,10 @@ def _figure(maps, specs):
     good = both & (np.abs(el.agreement) < 10) & (np.abs(az.agreement) < 10)
     a.scatter(az.position[good], el.position[good], s=1, alpha=0.15,
               c=np.sqrt(el.snr * az.snr)[good], cmap="magma")
-    a.axvline(-VIS_HALF["azimuth"], color="k", lw=0.5)
-    a.axvline(VIS_HALF["azimuth"], color="k", lw=0.5)
-    a.axhline(-VIS_HALF["elevation"], color="k", lw=0.5)
-    a.axhline(VIS_HALF["elevation"], color="k", lw=0.5)
+    for v in (-az.visible / 2, az.visible / 2):
+        a.axvline(v, color="k", lw=0.5)
+    for v in (-el.visible / 2, el.visible / 2):
+        a.axhline(v, color="k", lw=0.5)
     a.set_xlabel("azimuth (deg)")
     a.set_ylabel("elevation (deg)")
     a.set_title("visual field coverage\n(lines = screen extent)")

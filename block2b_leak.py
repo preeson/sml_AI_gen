@@ -47,7 +47,9 @@ PHASE_SIGMA = 2.0
 DELAY_SIGMA = 4.0
 
 PAIRS = [("elevation", "B2U", "U2B"), ("azimuth", "L2R", "R2L")]
-VIS_HALF = {"elevation": 33.4, "azimuth": 49.7}
+# Screen half-extents come from the stimulus log (see ioi_core), never from a
+# constant here -- they change with viewing distance and a stale value fails
+# silently.  They are carried in the cache alongside the components.
 
 CACHE = "components.npz"
 OUT_PNG = "block2b_leak.png"
@@ -57,7 +59,13 @@ def reduce_blocks():
     if os.path.exists(CACHE):
         print(f"loading cached reduction from {CACHE}")
         z = np.load(CACHE, allow_pickle=True)
-        return {k: z[k] for k in z.files}
+        d = {k: z[k] for k in z.files}
+        missing = [f"{l}_vishalf" for l in LABELS if f"{l}_vishalf" not in d]
+        if missing:
+            print(f"  cache predates the screen-extent change "
+                  f"({len(missing)} keys missing) -- redoing the reduction")
+        else:
+            return d
 
     ft = ioi.load_frame_times()
     log = ioi.load_stim_log(ft=ft)
@@ -76,6 +84,7 @@ def reduce_blocks():
             out[f"{blk.label}_fstim"] = np.array(blk.f_stim)
             out[f"{blk.label}_p0"] = np.array(blk.bar_deg_first)
             out[f"{blk.label}_p1"] = np.array(blk.bar_deg_last)
+            out[f"{blk.label}_vishalf"] = np.array(blk.visible_half)
             del fold
     print(f"  reduction took {time.time()-t0:.0f} s")
     np.savez_compressed(CACHE, **out)
@@ -100,6 +109,7 @@ def _blk(label, d):
         t0=0.0, t1=float(1 / d[f"{label}_fstim"]) * 15,
         bar_deg_first=float(d[f"{label}_p0"]),
         bar_deg_last=float(d[f"{label}_p1"]),
+        visible_half=float(d[f"{label}_vishalf"]),
     )
 
 
@@ -148,11 +158,12 @@ def main():
     for axis, f, rv in PAIRS:
         am = iom.combine_axis(resid[f], _blk(f, d), resid[rv], _blk(rv, d),
                               phase_sigma=PHASE_SIGMA, delay_sigma=DELAY_SIGMA,
-                              snr_min=0.0, visible_half=VIS_HALF[axis])
+                              snr_min=0.0,
+                              visible_half=float(d[f"{f}_vishalf"]))
         am.mask = bright
         maps[axis] = am
         m = bright
-        lim = VIS_HALF[axis]
+        lim = am.visible / 2.0
         inside = np.mean(np.abs(am.position[m]) <= lim) * 100
         print(f"\n{axis}:")
         chance = am.period / 4.0   # random phase -> delay uniform on [0, T/2]
@@ -251,7 +262,7 @@ def _figure(d, I, resid, fits, maps, bright):
     plt.colorbar(im, ax=a); a.set_title("fitted common mode (%dR/R)")
 
     for j, (axis, am) in enumerate(maps.items()):
-        lim = VIS_HALF[axis]
+        lim = am.visible / 2.0
         a = ax[2, j]
         im = a.imshow(np.where(bright, am.position, np.nan), cmap="jet",
                       vmin=-lim, vmax=lim)
@@ -260,10 +271,10 @@ def _figure(d, I, resid, fits, maps, bright):
     a = ax[2, 2]
     el, az = maps["elevation"], maps["azimuth"]
     a.scatter(az.position[bright], el.position[bright], s=1, alpha=0.1)
-    a.axvline(-VIS_HALF["azimuth"], color="k", lw=0.5)
-    a.axvline(VIS_HALF["azimuth"], color="k", lw=0.5)
-    a.axhline(-VIS_HALF["elevation"], color="k", lw=0.5)
-    a.axhline(VIS_HALF["elevation"], color="k", lw=0.5)
+    for v in (-az.visible / 2, az.visible / 2):
+        a.axvline(v, color="k", lw=0.5)
+    for v in (-el.visible / 2, el.visible / 2):
+        a.axhline(v, color="k", lw=0.5)
     a.set_xlabel("azimuth (deg)"); a.set_ylabel("elevation (deg)")
     a.set_title("visual field coverage after removal")
 

@@ -126,6 +126,39 @@ def test_timing():
     print(f"        effective display refresh = {log.effective_refresh:.4f} Hz")
 
 
+def test_visible_half_matches_geometry():
+    """
+    The screen half-extent read from the log must agree with plain trigonometry
+    on the monitor's physical size and viewing distance.  This is what stops a
+    stale hard-coded constant from silently mis-scaling every position map.
+    """
+    import pickle
+    ft = ioi.load_frame_times()
+    log = ioi.load_stim_log(ft=ft)
+    with open(ioi.STIMLOG_PATH, "rb") as f:
+        mon = pickle.load(f, encoding="latin1")["monitor"]
+
+    dis = float(mon["dis"])
+    exp_az = np.degrees(np.arctan(float(mon["mon_width_cm"]) / 2 / dis))
+    exp_el = np.degrees(np.arctan(float(mon["mon_height_cm"]) / 2 / dis))
+    got_az = log.visible_half["azimuth"]
+    got_el = log.visible_half["elevation"]
+    print(f"  azimuth   half-extent: log {got_az:.2f} deg, "
+          f"trig {exp_az:.2f} deg")
+    print(f"  elevation half-extent: log {got_el:.2f} deg, "
+          f"trig {exp_el:.2f} deg")
+    assert abs(got_az - exp_az) < 2.0, (got_az, exp_az)
+    assert abs(got_el - exp_el) < 2.0, (got_el, exp_el)
+
+    # every block must carry the half-extent for its own axis
+    for b in log.blocks:
+        want = got_el if b.axis == "elevation" else got_az
+        assert abs(b.visible_half - want) < 1e-6, (b.label, b.visible_half)
+    print("  PASS  test_visible_half_matches_geometry")
+    for line in log.travel_vs_visible.split("\n"):
+        print(f"        {line}")
+
+
 def test_analog():
     """Analog file must decode to 5 channels covering the camera window."""
     if not os.path.exists(ioi.ANALOG_PATH):
@@ -165,5 +198,6 @@ if __name__ == "__main__":
     test_handle_released()
     test_short_file_rejected()
     test_timing()
+    test_visible_half_matches_geometry()
     test_analog()
     print("all passed")
