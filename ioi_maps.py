@@ -180,3 +180,132 @@ def report(am: AxisMaps) -> str:
         f"{np.nanpercentile(am.position[m],98):.1f} deg",
     ]
     return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Joint delay across both axes
+# --------------------------------------------------------------------------
+
+def _phase01(c):
+    """Response phase as a fraction of a cycle, from the rfft convention."""
+    return wrap01(-np.angle(c) / TWO_PI)
+
+
+def combine_axes_joint(specs, blocks, pairs=(("elevation", "B2U", "U2B"),
+                                             ("azimuth", "L2R", "R2L")),
+                       phase_sigma: float = 2.0, delay_sigma: float = 4.0,
+                       mask=None, snr_min: float = 0.0):
+    """
+    Estimate ONE haemodynamic delay map from all four blocks, then use it for
+    both axes.
+
+    WHY
+    ---
+    Haemodynamic delay is a property of the tissue: it cannot depend on which
+    way the bar swept.  Estimating it separately per axis therefore throws
+    information away, and worse, it is much noisier for the slower axis.  The
+    delay from one axis pair is
+
+        tau = T * wrap01(phi_F + phi_R) / 2
+
+    so its error scales with the cycle period T:
+
+        sigma_tau = T/(4*pi) * sqrt(1/snr_F^2 + 1/snr_R^2)
+
+    Azimuth here has T = 22.4 s against elevation's 14.4 s, so at equal SNR the
+    azimuth delay is ~1.6x noisier.  That is why azimuth delay ran ~1 s longer
+    than elevation and drifted toward its own chance level: the estimate was
+    being pulled by noise, and the error fed straight into azimuth position.
+
+    Inverse-variance weighting fixes this.  The joint delay is dominated by the
+    better-conditioned elevation estimate, and azimuth position inherits it.
+
+    WHERE THE DELAY ACTUALLY MATTERS
+    --------------------------------
+    Worth being precise, because it is not where you would guess.  Writing
+    g_F and g_R for the two directions' position estimates as a fraction of
+    travel, the combined estimate is the circular mean of exp(2i.pi.g), and
+
+        g_F + g_R = 1 + phi_F - phi_R      -- tau cancels exactly
+        g_F - g_R = phi_F + phi_R - 2.tau/T - 1
+
+    The first line means the combined position is INDEPENDENT of tau within a
+    branch: only the half-difference of the phases survives.  The second means
+    tau decides which branch the circular mean lands in, because the mean
+    flips by half a cycle when cos(pi(g_F - g_R)) changes sign.
+
+    So a better delay does not nudge positions slightly -- it moves pixels
+    between branches, i.e. it fixes the ones that were wrapped by half the bar
+    travel.  That is exactly the failure that put ~15% of azimuth pixels
+    outside the screen extent, and why this matters for the sign map: a
+    wrapped pixel has a meaningless gradient.
+
+    Returns (maps, info) where maps is {axis: AxisMaps} and info carries the
+    per-axis delay and its residual against the joint estimate -- if those
+    residuals are large and structured, the model is wrong and you should know.
+    """
+    lab0 = pairs[0][1]
+    shape = specs[lab0].component.shape
+    if mask is None:
+        mask = np.ones(shape, dtype=bool)
+        for _, f, r in pairs:
+            mask &= specs[f].mask & specs[r].mask
+            if snr_min > 0:
+                mask &= (specs[f].snr > snr_min) & (specs[r].snr > snr_min)
+
+    per_axis = {}
+    tau_num = np.zeros(shape)
+    tau_den = np.zeros(shape)
+
+    for axis, f, r in pairs:
+        cF = smooth_masked(specs[f].component, specs[f].mask, phase_sigma)
+        cR = smooth_masked(specs[r].component, specs[r].mask, phase_sigma)
+        phiF, phiR = _phase01(cF), _phase01(cR)
+        T = 0.5 * (1.0 / blocks[f].f_stim + 1.0 / blocks[r].f_stim)
+        tau = T * wrap01(phiF + phiR) / 2.0
+
+        snrF = np.maximum(specs[f].snr, 1e-3)
+        snrR = np.maximum(specs[r].snr, 1e-3)
+        sig = T / (2 * TWO_PI) * np.sqrt(1.0 / snrF ** 2 + 1.0 / snrR ** 2)
+        w = np.where(np.isfinite(tau) & mask, 1.0 / np.maximum(sig, 1e-9) ** 2, 0.0)
+
+        per_axis[axis] = dict(phiF=phiF, phiR=phiR, T=T, tau=tau, sigma=sig,
+                              fwd=f, rev=r)
+        tau_num += np.nan_to_num(tau) * w
+        tau_den += w
+
+    tau_joint = np.where(tau_den > 0, tau_num / np.maximum(tau_den, 1e-30), np.nan)
+    tau_joint = smooth_masked(tau_joint, mask & np.isfinite(tau_joint), delay_sigma)
+
+    maps, info = {}, {"delay_joint": tau_joint}
+    for axis, f, r in pairs:
+        a = per_axis[axis]
+        T = a["T"]
+        p0F, p1F = blocks[f].bar_deg_first, blocks[f].bar_deg_last
+        p0R, p1R = blocks[r].bar_deg_first, blocks[r].bar_deg_last
+        uF = wrap01(a["phiF"] - tau_joint / T)
+        uR = wrap01(a["phiR"] - tau_joint / T)
+        posF = p0F + uF * (p1F - p0F)
+        posR = p0R + uR * (p1R - p0R)
+
+        travel = p1F - p0F
+        gF = (posF - p0F) / travel
+        gR = (posR - p0F) / travel
+        z = 0.5 * (np.exp(1j * TWO_PI * gF) + np.exp(1j * TWO_PI * gR))
+        position = p0F + wrap01(np.angle(z) / TWO_PI) * travel
+
+        maps[axis] = AxisMaps(
+            axis=axis, label_fwd=f, label_rev=r,
+            delay=tau_joint, delay_raw=a["tau"],
+            position=position, pos_fwd=posF, pos_rev=posR,
+            agreement=wrap_pi(TWO_PI * (gF - gR)) / TWO_PI * travel,
+            consistency=np.abs(z),
+            amplitude=0.5 * (specs[f].amplitude + specs[r].amplitude),
+            snr=np.sqrt(specs[f].snr ** 2 + specs[r].snr ** 2),
+            mask=mask, travel=abs(travel),
+            visible=2 * blocks[f].visible_half, period=T,
+        )
+        info[f"delay_{axis}"] = a["tau"]
+        info[f"delay_resid_{axis}"] = a["tau"] - tau_joint
+        info[f"sigma_{axis}"] = a["sigma"]
+    return maps, info
