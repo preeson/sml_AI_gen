@@ -61,9 +61,19 @@ def reduce_blocks():
         z = np.load(CACHE, allow_pickle=True)
         d = {k: z[k] for k in z.files}
         missing = [f"{l}_vishalf" for l in LABELS if f"{l}_vishalf" not in d]
-        if missing:
-            print(f"  cache predates the screen-extent change "
-                  f"({len(missing)} keys missing) -- redoing the reduction")
+        stale = "_source_dat" not in d
+        wrong = (not stale) and str(d["_source_dat"]) != str(ioi.DAT_PATH)
+        if missing or stale:
+            print("  cache predates a change in the pipeline -- redoing the "
+                  "reduction")
+        elif wrong:
+            # A fixed cache filename in the working directory is a real hazard
+            # when several recordings are analysed in the same folder: without
+            # this check you would silently analyse the previous recording.
+            print(f"  !! cache was built from a DIFFERENT recording:\n"
+                  f"       cache : {str(d['_source_dat'])}\n"
+                  f"       config: {ioi.DAT_PATH}\n"
+                  f"     redoing the reduction")
         else:
             return d
 
@@ -86,6 +96,8 @@ def reduce_blocks():
             out[f"{blk.label}_p1"] = np.array(blk.bar_deg_last)
             out[f"{blk.label}_vishalf"] = np.array(blk.visible_half)
             del fold
+    out["_source_dat"] = np.array(ioi.DAT_PATH)
+    out["_source_nframes"] = np.array(ft.n_frames)
     print(f"  reduction took {time.time()-t0:.0f} s")
     np.savez_compressed(CACHE, **out)
     return out
