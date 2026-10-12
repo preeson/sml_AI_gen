@@ -158,7 +158,7 @@ class BlockSpectrum:
 
 
 def analyse(fold: FoldedBlock, offset: float = 1540.0, detrend_order: int = 3,
-            min_counts: float = 500.0,
+            min_counts: float = 500.0, sat_level: float = 64000.0,
             noise_offsets=(-4, -3, -2, -1, 1, 2, 3, 4),
             k: int | None = None, exclude_bins=()) -> BlockSpectrum:
     """
@@ -169,6 +169,13 @@ def analyse(fold: FoldedBlock, offset: float = 1540.0, detrend_order: int = 3,
     min_counts : pixels whose block-mean is below offset + min_counts are
                  masked out.  Without this, vignetted / dental-cement pixels
                  divide by ~0 and produce enormous meaningless phases.
+    sat_level  : pixels whose block-mean reaches this many RAW counts are
+                 masked out as saturated.  A pixel pinned at 65535 for the
+                 whole block has exactly zero variance, so its amplitude and
+                 its noise are both 0 and the SNR comes out 0/0 = NaN -- which
+                 then poisons every median taken over the mask.  This is not
+                 hypothetical: it is what produced "SNR median nan" once the
+                 illumination was raised.
     k          : which DFT bin to read.  Defaults to fold.n_cycles, the
                  stimulus bin.  Pass a neighbouring bin to run the whole
                  pipeline on a frequency where no stimulus exists -- that is
@@ -180,7 +187,7 @@ def analyse(fold: FoldedBlock, offset: float = 1540.0, detrend_order: int = 3,
     k_stim = fold.n_cycles if k is None else int(k)
 
     denom = fold.mean_image - offset
-    mask = denom > min_counts
+    mask = (denom > min_counts) & (fold.mean_image < sat_level)
 
     x = (fold.cycles - fold.mean_image[None]) / np.where(mask, denom, np.nan)[None]
     x = x.reshape(n_bins, -1)
@@ -212,8 +219,13 @@ def analyse(fold: FoldedBlock, offset: float = 1540.0, detrend_order: int = 3,
     power_mean = pw[:, mask.ravel()].mean(axis=1)
 
     amp = np.abs(comp).reshape(h, w)
+    nz = noise.reshape(h, w)
+    # belt and braces: any pixel with a degenerate (zero) noise estimate is
+    # dropped rather than allowed to emit NaN or inf into the maps.
+    bad = ~np.isfinite(nz) | (nz <= 0)
+    mask = mask & ~bad
     with np.errstate(invalid="ignore", divide="ignore"):
-        snr = amp / noise.reshape(h, w)
+        snr = np.where(bad, np.nan, amp / np.where(nz > 0, nz, np.nan))
 
     return BlockSpectrum(
         label=fold.label,

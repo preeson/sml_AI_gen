@@ -135,6 +135,31 @@ def test_dropped_frames_handled():
     print("  PASS  test_dropped_frames_handled")
 
 
+def test_saturated_pixels_do_not_produce_nan():
+    """
+    A pixel pinned at the 65535 ceiling has zero variance, so amplitude and
+    noise are both 0 and SNR = 0/0 = NaN.  One such pixel poisons every median
+    taken over the mask -- which is exactly what turned the pilot's SNR line
+    into "nan" once the illumination was raised.
+    """
+    mov, ft, blk, _, _ = tf_make()
+    mov[:, :, :8] = 65535.0          # a saturated strip
+    fold = iof.fold_block(mov, ft, blk, bins_per_cycle=80, bin_xy=1)
+    sp = iof.analyse(fold, offset=1540.0, min_counts=500.0, sat_level=64000.0)
+    assert not sp.mask[:, :8].any(), "saturated pixels were not masked"
+    assert sp.mask[:, 10:].all(), "good pixels were wrongly masked"
+    for name, arr in (("snr", sp.snr), ("amplitude", sp.amplitude),
+                      ("noise", sp.noise)):
+        assert np.all(np.isfinite(arr[sp.mask])), f"NaN/inf survived in {name}"
+    print(f"  saturated strip masked; median SNR over the mask "
+          f"{np.median(sp.snr[sp.mask]):.2f} (finite, not nan)")
+    print("  PASS  test_saturated_pixels_do_not_produce_nan")
+
+
+def tf_make():
+    return make_synthetic(amp=0.002)
+
+
 def test_mask_excludes_dark_pixels():
     mov, ft, blk, _, _ = make_synthetic()
     mov[:, :, :10] = 1545.0  # a strip of "dental cement" just above pedestal
@@ -152,4 +177,5 @@ if __name__ == "__main__":
     test_adjacent_bin_is_orthogonal()
     test_dropped_frames_handled()
     test_mask_excludes_dark_pixels()
+    test_saturated_pixels_do_not_produce_nan()
     print("all passed")

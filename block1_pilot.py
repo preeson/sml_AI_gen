@@ -33,12 +33,14 @@ BINS_PER_CYCLE = 80    # -> 1200 samples, ~4.9 Hz, Nyquist 40x F
 CHUNK = 256            # camera frames held in RAM at once (~350 MB float32)
 OFFSET = 1540.0        # camera pedestal, counts
 MIN_COUNTS = 500.0     # mask: block-mean must exceed OFFSET + this
+SAT_LEVEL = 64000.0    # mask out pixels at/near the 65535 ceiling
 FRAC_NOISE = 0.0174    # measured per-frame per-pixel noise from Block 0
 OUT_PNG = "block1_pilot.png"
 
 
 def run(mov, ft, block, bin_xy=BIN_XY, bins_per_cycle=BINS_PER_CYCLE,
-        chunk=CHUNK, offset=OFFSET, min_counts=MIN_COUNTS, plot=True):
+        chunk=CHUNK, offset=OFFSET, min_counts=MIN_COUNTS,
+        sat_level=SAT_LEVEL, plot=True):
     n_frames = block.n_cam_frames
     gb = n_frames * ioi.BYTES_PER_FRAME / 1024 ** 3
     print(f"block {block.label}: camera frames {block.cam0}-{block.cam1} "
@@ -67,15 +69,21 @@ def run(mov, ft, block, bin_xy=BIN_XY, bins_per_cycle=BINS_PER_CYCLE,
     if fold.n_empty:
         print(f"  note: {fold.n_empty} empty phase bins filled from neighbours")
 
-    sp = iof.analyse(fold, offset=offset, min_counts=min_counts)
+    sp = iof.analyse(fold, offset=offset, min_counts=min_counts,
+                     sat_level=sat_level)
 
     m = sp.mask
+    n_sat = int(np.sum(fold.mean_image >= sat_level))
+    if n_sat:
+        print(f"\n  NOTE: {n_sat} binned pixels masked as saturated "
+              f"(block-mean >= {sat_level:.0f} counts)")
     print(f"\n  mask: {m.sum()} / {m.size} pixels "
           f"({100*m.mean():.1f}%) above offset + {min_counts:.0f}")
 
     amp = sp.amplitude[m]
     snr = sp.snr[m]
     noise = sp.noise[m]
+    shot_frac = None
 
     shot = FRAC_NOISE * np.sqrt(2.0 / fold.n_per_bin.sum()) / bin_xy
     print(f"\n  noise per bin (per-quadrature):")
