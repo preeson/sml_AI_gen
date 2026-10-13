@@ -34,7 +34,7 @@ CHUNK = 256            # camera frames held in RAM at once (~350 MB float32)
 OFFSET = 1540.0        # camera pedestal, counts
 MIN_COUNTS = 500.0     # mask: block-mean must exceed OFFSET + this
 SAT_LEVEL = 64000.0    # mask out pixels at/near the 65535 ceiling
-FRAC_NOISE = 0.0174    # measured per-frame per-pixel noise from Block 0
+FRAC_NOISE = 0.0106    # measured per-frame per-pixel noise from Block 0
 OUT_PNG = "block1_pilot.png"
 
 
