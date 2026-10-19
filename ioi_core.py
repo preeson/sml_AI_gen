@@ -30,14 +30,14 @@ import scipy.io as sio
 # Configuration -- edit these paths for your machine
 # --------------------------------------------------------------------------
 
-DATA_DIR = r"\\157.136.61.135\eq-gbouvier\Patrick\HeadTilt\data\IOS\c57-N1\c57-N1_thinskull\mapHVA_wrap\18-Oct-2026"
+DATA_DIR = r"/mnt/user-data/uploads"
 
 DAT_PATH = os.path.join(DATA_DIR, "Frames_1_640_540_uint16_0001.dat")
 FRAMETIMES_PATH = os.path.join(DATA_DIR, "frameTimes_0001.mat")
 ANALOG_PATH = os.path.join(DATA_DIR, "Analog_1.dat")
 STIMLOG_PATH = os.path.join(
     DATA_DIR,
-    "261018154230-KSstimAllDir-Mc57-N1_thinskull-plr-plr-notTriggered-complete.pkl",
+    "260909145607-KSstimAllDir-Mc57-M1_trial1-plr-plr-notTriggered-complete.pkl",
 )
 
 FRAME_H = 540           # rows,    = imgSize(1)
@@ -196,6 +196,8 @@ class StimBlock:
     bar_deg_last: float = 0.0    # bar CENTRE at the last frame of a cycle
     visible_half: float = 0.0    # half-extent of the SCREEN along this axis,
                                  # in degrees, from the monitor geometry
+    n_cycles_designed: int = 0   # cycles the stimulus presented
+    truncated: bool = False      # recording ended inside this block
 
     @property
     def n_cam_frames(self) -> int:
@@ -225,8 +227,24 @@ class StimLog:
     visible_half: dict = field(default_factory=dict)  # axis -> half-extent deg
     nominal_refresh: float = 60.0
     effective_refresh: float = 0.0
+    display_hz_source: str = "nominal"   # nominal | measured | caller
     n_reps: int = 1              # DisplaySequence.display_iter
     rep: int = 0                 # which repeat these blocks come from
+    onset_frame: int = 0         # camera frame holding stimulus frame 0
+    fps_cam: float = 0.0         # camera rate from its own timestamps
+    overrun_frames: float = 0.0  # camera frames the stimulus needed but
+                                 # the recording does not have
+
+    @property
+    def coverage(self) -> str:
+        """One line on whether the recording actually holds the stimulus."""
+        if self.overrun_frames <= 0:
+            return (f"recording covers the whole stimulus "
+                    f"({self.n_stim_frames} frames at {self.nominal_refresh:g} Hz)")
+        return (f"!! the stimulus runs {self.overrun_frames / self.fps_cam:.1f} s "
+                f"past the end of the recording "
+                f"({self.overrun_frames:.0f} camera frames short); "
+                f"blocks beyond that point are truncated or dropped")
 
     @property
     def travel_vs_visible(self) -> str:
@@ -261,7 +279,8 @@ _AXIS_OF = {"B2U": "elevation", "U2B": "elevation",
 
 
 def load_stim_log(path: str | None = None, ft: FrameTimes | None = None,
-                  rep: int = 0) -> StimLog:
+                  rep: int = 0, onset_frame: int | None = None,
+                  display_hz: float | None = None) -> StimLog:
     """
     Parse the WarpedVisualStim pickle and place every block on the camera clock.
 
@@ -327,9 +346,51 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None,
         "elevation": float(mon["deg_coord_y"].max() - mon["deg_coord_y"].min()) / 2.0,
     }
 
-    # camera frames per stimulus frame
-    span = ft.post_stim - ft.pre_stim
-    scale = span / n_stim
+    # ----------------------------------------------------------------------
+    # Camera frames per stimulus frame.
+    #
+    # NOT (post_stim - pre_stim) / n_stim.  That divides the stimulus into the
+    # recording, so it silently rescales time whenever the two do not in fact
+    # cover the same interval -- and it can never fail, because the answer is
+    # defined to fit.  On the 261018 session the camera stopped 341 s before
+    # the display finished and that expression stretched every block by 1.16x,
+    # reporting a 69.66 Hz "effective refresh" for a 60 Hz monitor.
+    #
+    # Instead take the ratio of two clocks that were measured independently:
+    # the camera's own timestamps and the display's refresh rate.  Then check
+    # the result against the recording instead of assuming it.
+    # ----------------------------------------------------------------------
+    fps_cam = (ft.n_frames - 1) / (ft.t[-1] - ft.t[0])
+
+    # Display rate: prefer the display's OWN measured rate over the monitor's
+    # nominal refresh, but only when it is credible.  DisplayStimulus._display
+    # originally timestamped frames with time.process_time(), which on Windows
+    # ticks at 64 Hz and sums CPU across threads -- it ran about 2x fast and
+    # was useless as a wall clock.  After the switch to time.perf_counter() the
+    # same field measures 59.9960 Hz with 0.15 ms of jitter.  Accepting it only
+    # within 10% of nominal keeps the old corrupt-clock sessions on the nominal
+    # value while new ones calibrate themselves.
+    fps_nom = float(d["monitor"]["refresh_rate"])
+    fps_src = "nominal"
+    if display_hz is not None:
+        fps_disp, fps_src = float(display_hz), "caller"
+    else:
+        fps_disp = fps_nom
+        ts = np.asarray(pres.get("frame_ts_start", ()), dtype=float).ravel()
+        if ts.size > 100 and ts[-1] > ts[0]:
+            meas = (ts.size - 1) / (ts[-1] - ts[0])
+            if 0.9 * fps_nom <= meas <= 1.1 * fps_nom:
+                fps_disp, fps_src = meas, "measured"
+
+    scale = fps_cam / fps_disp
+    origin = ft.pre_stim if onset_frame is None else int(onset_frame)
+
+    # A constant error in `origin` is harmless for retinotopy: it shifts the
+    # forward and reverse phases of a pair equally, so it cancels out of
+    # position = phase_fwd - delay and lands entirely in the delay estimate.
+    # Getting `scale` wrong does not cancel, which is why it is measured.
+    need = origin + n_stim * scale
+    overrun = need - ft.n_frames
 
     blocks = []
     for label in stim["direction"]:
@@ -349,9 +410,20 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None,
                 f"{fpc}-frame cycles (remainder {rem})"
             )
 
-        k0, k1 = int(idx[0]) + rep * n_pass, int(idx[-1]) + rep * n_pass
-        cam0 = int(round(ft.pre_stim + k0 * scale))
-        cam1 = int(round(ft.pre_stim + (k1 + 1) * scale))
+        k0 = int(idx[0]) + rep * n_pass
+        cam0 = int(round(origin + k0 * scale))
+
+        # Keep only whole cycles that were actually recorded.  A partial cycle
+        # must not be included: the integer-cycle design is the only reason
+        # bin 15 is free of leakage from its neighbours.
+        n_designed = n_cyc
+        fits = int(np.floor((ft.n_frames - cam0) / (fpc * scale)))
+        n_cyc = max(0, min(n_cyc, fits))
+        truncated = n_cyc < n_designed
+        if n_cyc == 0:
+            continue
+        k1 = k0 + n_cyc * fpc - 1
+        cam1 = int(round(origin + (k1 + 1) * scale))
 
         blocks.append(StimBlock(
             label=str(label),
@@ -365,6 +437,8 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None,
             bar_deg_first=float(rows[0][1] + rows[0][2]) / 2.0,
             bar_deg_last=float(rows[-1][1] + rows[-1][2]) / 2.0,
             visible_half=visible_half[_AXIS_OF.get(str(label), "azimuth")],
+            n_cycles_designed=n_designed,
+            truncated=truncated,
         ))
 
     log = StimLog(
@@ -374,12 +448,20 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None,
         sweep_width=float(stim["sweep_width"]),
         step_width=float(stim["step_width"]),
         visible_half=visible_half,
-        nominal_refresh=float(d["monitor"]["refresh_rate"]),
+        nominal_refresh=fps_disp,
+        display_hz_source=fps_src,
         n_reps=n_reps,
         rep=rep,
+        onset_frame=origin,
+        fps_cam=fps_cam,
+        overrun_frames=max(0.0, overrun),
     )
+    # What the display rate would have to have been for the stimulus to fill
+    # the recording exactly -- the old, load-bearing assumption.  Kept purely
+    # as a diagnostic: if this is not close to the nominal refresh, the two
+    # did not cover the same interval and `overrun_frames` says by how much.
     total = ft.t[min(ft.post_stim, ft.n_frames - 1)] - ft.t[ft.pre_stim]
-    log.effective_refresh = n_stim / total
+    log.effective_refresh = n_stim / total if total > 0 else float("nan")
     return log
 
 
@@ -412,11 +494,27 @@ def load_analog(path: str | None = None, ft: FrameTimes | None = None,
     """
     Read a WidefieldImager Analog_N.dat.
 
-    Layout: one float64 giving the header length, then that many float64s
-    (datenum, n_channels, n_samples -- the last is Inf when the recording was
-    streamed), then uint16 samples.  MATLAB stores analogData as
-    (n_channels x n_samples) column-major, so the byte stream is
-    channel-interleaved and reshapes to (n_samples, n_channels).
+    Layout, from WidefieldImager/logAnalogData.m: one float64 giving the
+    header length (3), then three more float64s -- evt.TriggerTime, then
+    size(evt.Data,2)+1, then Inf.  FOUR doubles in total; skipping only three
+    shifts every channel by one and is an easy mistake to make.
+
+    Then uint16 of [evt.TimeStamps*1000, evt.Data*1000]', so:
+
+      * column 0 is ELAPSED TIME IN MILLISECONDS, not a channel.  MATLAB's
+        uint16 cast saturates rather than wrapping, so it ramps 0 -> 65535
+        over the first 65.535 s and then sits at 65535 for the rest of the
+        recording.  That ramp is a free confirmation of the 1 kHz rate.
+      * columns 1..4 are AI0..AI3 in millivolts.  The DAQ session is built
+        with addAnalogInputChannel(..., 0:3, 'Voltage') -- there are only
+        four analog inputs, and anything wired beyond AI3 is not recorded.
+
+    Per the protocol's wiring diagram the intended assignment is
+    AI0 = 470 nm LED driver, AI1 = 405 nm LED driver, AI2 = stimulus onset,
+    AI3 = behaviour.  The stimulus photodiode belongs on AI2.
+
+    n_channels in the header counts the timestamp column, so it is 5 for a
+    four-channel recording.
     """
     path = _require(ANALOG_PATH if path is None else path)
     if ft is None:
