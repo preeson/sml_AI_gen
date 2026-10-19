@@ -20,6 +20,8 @@ Sanity checks to read in the output:
 
 import time
 
+import sys
+
 import numpy as np
 import matplotlib
 
@@ -48,13 +50,23 @@ PAIRS = [("elevation", "B2U", "U2B"), ("azimuth", "L2R", "R2L")]
 UM_PER_PIXEL = 6150.0 / 640.0 * BIN_XY   # 9.609 um * BIN_XY
 
 CORNER = (slice(95, None), slice(0, 70))  # the bright region from the pilot
-OUT_PNG = "block2_maps.png"
-OUT_NPZ = "maps.npz"
+# ---------------------------------------------------------------------------
+# Which pass through the four directions to analyse.  DisplaySequence's
+# display_iter replays the whole B2U/U2B/L2R/R2L sequence that many times in
+# one recording, so a display_iter=3 session holds three independent trials.
+# No argument  -> rep 0, output names unchanged (old single-pass sessions).
+# An argument  -> that rep, with the rep number in the output file names.
+# ---------------------------------------------------------------------------
+REP = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+SUF = f"_rep{REP}" if len(sys.argv) > 1 else ""
+
+OUT_PNG = f"block2_maps{SUF}.png"
+OUT_NPZ = f"maps{SUF}.npz"
 
 
 def main():
     ft = ioi.load_frame_times()
-    log = ioi.load_stim_log(ft=ft)
+    log = ioi.load_stim_log(ft=ft, rep=REP)
     print(log.travel_vs_visible)
 
     specs, blocks = {}, {}

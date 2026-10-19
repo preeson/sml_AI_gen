@@ -47,6 +47,8 @@ path.
 import os
 import time
 
+import sys
+
 import numpy as np
 import matplotlib
 
@@ -77,8 +79,18 @@ PAIRS = [("elevation", "B2U", "U2B"), ("azimuth", "L2R", "R2L")]
 # constant here -- they change with viewing distance and a stale value fails
 # silently.  They are carried in the cache alongside the components.
 
-CACHE = "components_bins.npz"
-OUT_PNG = "block2c_control.png"
+# ---------------------------------------------------------------------------
+# Which pass through the four directions to analyse.  DisplaySequence's
+# display_iter replays the whole B2U/U2B/L2R/R2L sequence that many times in
+# one recording, so a display_iter=3 session holds three independent trials.
+# No argument  -> rep 0, output names unchanged (old single-pass sessions).
+# An argument  -> that rep, with the rep number in the output file names.
+# ---------------------------------------------------------------------------
+REP = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+SUF = f"_rep{REP}" if len(sys.argv) > 1 else ""
+
+CACHE = f"components_bins{SUF}.npz"
+OUT_PNG = f"block2c_control{SUF}.png"
 
 
 def reduce_all_bins():
@@ -104,7 +116,7 @@ def reduce_all_bins():
             return d
 
     ft = ioi.load_frame_times()
-    log = ioi.load_stim_log(ft=ft)
+    log = ioi.load_stim_log(ft=ft, rep=REP)
     out = {}
     t0 = time.time()
     with ioi.movie() as mov:

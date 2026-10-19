@@ -30,13 +30,14 @@ import scipy.io as sio
 # Configuration -- edit these paths for your machine
 # --------------------------------------------------------------------------
 
-DATA_DIR = r"\\157.136.61.135\eq-gbouvier\Patrick\HeadTilt\data\IOS\SST-Ai9_E1\11102026\trial1\11-Oct-2026"
+DATA_DIR = r"\\157.136.61.135\eq-gbouvier\Patrick\HeadTilt\data\IOS\c57-N1\c57-N1_thinskull\mapHVA_wrap\18-Oct-2026"
+
 DAT_PATH = os.path.join(DATA_DIR, "Frames_1_640_540_uint16_0001.dat")
 FRAMETIMES_PATH = os.path.join(DATA_DIR, "frameTimes_0001.mat")
 ANALOG_PATH = os.path.join(DATA_DIR, "Analog_1.dat")
 STIMLOG_PATH = os.path.join(
     DATA_DIR,
-    "261011172109-KSstimAllDir-MSST-Ai9_E1_trial1-plr-plr-notTriggered-complete.pkl",
+    "261018154230-KSstimAllDir-Mc57-N1_thinskull-plr-plr-notTriggered-complete.pkl",
 )
 
 FRAME_H = 540           # rows,    = imgSize(1)
@@ -217,13 +218,15 @@ class StimBlock:
 @dataclass
 class StimLog:
     raw: dict = field(repr=False)
-    n_stim_frames: int = 0
+    n_stim_frames: int = 0       # TOTAL stimulus frames shown (all repeats)
     blocks: list = field(default_factory=list)
     sweep_width: float = 0.0
     step_width: float = 0.0
     visible_half: dict = field(default_factory=dict)  # axis -> half-extent deg
     nominal_refresh: float = 60.0
     effective_refresh: float = 0.0
+    n_reps: int = 1              # DisplaySequence.display_iter
+    rep: int = 0                 # which repeat these blocks come from
 
     @property
     def travel_vs_visible(self) -> str:
@@ -257,14 +260,25 @@ _AXIS_OF = {"B2U": "elevation", "U2B": "elevation",
             "L2R": "azimuth", "R2L": "azimuth"}
 
 
-def load_stim_log(path: str | None = None, ft: FrameTimes | None = None) -> StimLog:
+def load_stim_log(path: str | None = None, ft: FrameTimes | None = None,
+                  rep: int = 0) -> StimLog:
     """
     Parse the WarpedVisualStim pickle and place every block on the camera clock.
 
-    The pickle's own timestamps are discarded.  Instead we assume the 69630
-    stimulus frames were presented uniformly across the camera's stimulus
+    The pickle's own timestamps are discarded.  Instead the stimulus frames are
+    assumed to have been presented uniformly across the camera's stimulus
     window (frames pre_stim .. post_stim).  End-to-end this assumption agrees
     with the nominal 60 Hz design to 0.13%, which bounds any cumulative drift.
+
+    rep : which pass through the four directions to return blocks for.
+
+        DisplaySequence.display_iter replays the whole generated sequence that
+        many times, but stim['frames'] only ever holds ONE pass -- the stimulus
+        object knows nothing about display_iter.  Taking len(frames) as the
+        number of stimulus frames the camera saw therefore stretches every
+        block by display_iter, and block 1 silently swallows the whole
+        recording.  The total comes from presentation['displayed_frames'],
+        which records what was actually shown.
     """
     path = _require(STIMLOG_PATH if path is None else path)
     if ft is None:
@@ -278,7 +292,24 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None) -> Stim
     # frame_config = ('is_display', 'squarePolarity', 'sweep_index', 'indicator_color')
     # plus a 5th element carrying the direction label.
     direction = np.array([fr[4] for fr in frames])
-    n_stim = len(frames)
+    n_pass = len(frames)            # stimulus frames in ONE pass
+
+    pres = d.get("presentation", {}) or {}
+    n_reps = int(pres.get("display_iter") or 1)
+    shown = pres.get("displayed_frames") or ()
+    if len(shown):
+        n_reps_shown, rem = divmod(len(shown), n_pass)
+        if rem or n_reps_shown < 1:
+            raise ValueError(
+                f"{len(shown)} displayed frames is not a whole number of "
+                f"{n_pass}-frame passes (remainder {rem}) -- the display was "
+                f"probably interrupted; keep_display="
+                f"{pres.get('keep_display')!r}"
+            )
+        n_reps = n_reps_shown
+    if not 0 <= rep < n_reps:
+        raise IndexError(f"rep {rep} out of range: {n_reps} repeat(s) displayed")
+    n_stim = n_pass * n_reps
 
     sweep_table = stim["sweep_table"]  # (direction, start_deg, end_deg)
 
@@ -287,10 +318,13 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None) -> Stim
     # hard-coding it means the value can never disagree with the stimulus that
     # was actually presented -- viewing distance and screen size change
     # between sessions, and a stale constant fails silently.
+    # Half the full extent, NOT max(|coord|): those agree only when the
+    # monitor is centred on (0, 0).  With center_coordinates=(0., 60.) the
+    # azimuth grid runs 16..104 deg and max(|.|) would claim a 208 deg screen.
     mon = d["monitor"]
     visible_half = {
-        "azimuth": float(np.abs(mon["deg_coord_x"]).max()),
-        "elevation": float(np.abs(mon["deg_coord_y"]).max()),
+        "azimuth": float(mon["deg_coord_x"].max() - mon["deg_coord_x"].min()) / 2.0,
+        "elevation": float(mon["deg_coord_y"].max() - mon["deg_coord_y"].min()) / 2.0,
     }
 
     # camera frames per stimulus frame
@@ -315,7 +349,7 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None) -> Stim
                 f"{fpc}-frame cycles (remainder {rem})"
             )
 
-        k0, k1 = int(idx[0]), int(idx[-1])
+        k0, k1 = int(idx[0]) + rep * n_pass, int(idx[-1]) + rep * n_pass
         cam0 = int(round(ft.pre_stim + k0 * scale))
         cam1 = int(round(ft.pre_stim + (k1 + 1) * scale))
 
@@ -341,6 +375,8 @@ def load_stim_log(path: str | None = None, ft: FrameTimes | None = None) -> Stim
         step_width=float(stim["step_width"]),
         visible_half=visible_half,
         nominal_refresh=float(d["monitor"]["refresh_rate"]),
+        n_reps=n_reps,
+        rep=rep,
     )
     total = ft.t[min(ft.post_stim, ft.n_frames - 1)] - ft.t[ft.pre_stim]
     log.effective_refresh = n_stim / total

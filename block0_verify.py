@@ -79,33 +79,48 @@ def main():
     for line in log.travel_vs_visible.split("\n"):
         print(f"  {line}")
     print()
-    hdr = (f"  {'blk':<5}{'axis':<11}{'cam frames':<20}{'dur (s)':>9}"
+    # DisplaySequence.display_iter replays the whole four-direction sequence,
+    # so a display_iter=3 recording holds three independent trials back to
+    # back.  Walk every repeat: the tiling check is only meaningful over all
+    # of them, and rep 0 alone would look like it stops a third of the way in.
+    if log.n_reps == 1:
+        print("  display_iter = 1 (single pass, 4 blocks)")
+    else:
+        print(f"  display_iter = {log.n_reps} -> {log.n_reps} independent "
+              f"trials in this recording, {4 * log.n_reps} blocks")
+    print()
+    hdr = (f"  {'rep':<4}{'blk':<5}{'axis':<11}{'cam frames':<20}{'dur (s)':>9}"
            f"{'cyc':>5}{'F (Hz)':>10}{'bar centre (deg)':>22}{'screen':>9}")
     print(hdr)
-    for b in log.blocks:
-        print(f"  {b.label:<5}{b.axis:<11}"
-              f"{f'{b.cam0}-{b.cam1}':<20}{b.duration:9.2f}"
-              f"{b.n_cycles:5d}{b.f_stim:10.6f}"
-              f"{f'{b.bar_deg_first:+.1f} -> {b.bar_deg_last:+.1f}':>22}"
-              f"{f'+-{b.visible_half:.1f}':>9}")
+    every = []
+    for r in range(log.n_reps):
+        lg = log if r == log.rep else ioi.load_stim_log(ft=ft, rep=r)
+        for b in lg.blocks:
+            print(f"  {r:<4}{b.label:<5}{b.axis:<11}"
+                  f"{f'{b.cam0}-{b.cam1}':<20}{b.duration:9.2f}"
+                  f"{b.n_cycles:5d}{b.f_stim:10.6f}"
+                  f"{f'{b.bar_deg_first:+.1f} -> {b.bar_deg_last:+.1f}':>22}"
+                  f"{f'+-{b.visible_half:.1f}':>9}")
+            every.append(b)
 
-    # contiguity / containment
+    # contiguity / containment, across every repeat
     ok = True
-    for a, c in zip(log.blocks, log.blocks[1:]):
+    every.sort(key=lambda b: b.cam0)
+    for a, c in zip(every, every[1:]):
         if a.cam1 != c.cam0:
             print(f"  !! gap/overlap between {a.label} and {c.label}: "
                   f"{a.cam1} vs {c.cam0}")
             ok = False
-    if log.blocks[0].cam0 != ft.pre_stim:
-        print(f"  !! first block starts at {log.blocks[0].cam0}, "
+    if every[0].cam0 != ft.pre_stim:
+        print(f"  !! first block starts at {every[0].cam0}, "
               f"expected {ft.pre_stim}")
         ok = False
-    if log.blocks[-1].cam1 != ft.post_stim:
-        print(f"  !! last block ends at {log.blocks[-1].cam1}, "
+    if every[-1].cam1 != ft.post_stim:
+        print(f"  !! last block ends at {every[-1].cam1}, "
               f"expected {ft.post_stim}")
         ok = False
     if ok:
-        print("  OK: blocks tile the stimulus window exactly.")
+        print(f"  OK: {len(every)} blocks tile the stimulus window exactly.")
 
     # ---- 4. pixel layout -------------------------------------------------
     rule("4. Pixel layout")
