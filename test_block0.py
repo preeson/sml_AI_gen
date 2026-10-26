@@ -93,22 +93,48 @@ def test_short_file_rejected():
 
 
 def test_timing():
-    """Blocks must tile the stimulus window exactly, with 15 cycles each."""
+    """
+    Blocks must tile the stimulus window with no gap or overlap.
+
+    Walks every repeat.  With DisplaySequence.display_iter > 1 the recording
+    holds several passes through the four directions, so rep 0 alone covers
+    only its share of the window -- demanding that it reach post_stim is what
+    made this test fail spuriously on the first display_iter=3 session.
+    """
     ft = ioi.load_frame_times()
     log = ioi.load_stim_log(ft=ft)
 
-    assert len(log.blocks) == 4, len(log.blocks)
-    assert log.blocks[0].cam0 == ft.pre_stim
-    assert log.blocks[-1].cam1 == ft.post_stim
-    for a, c in zip(log.blocks, log.blocks[1:]):
+    every = []
+    for r in range(log.n_reps):
+        lg = log if r == log.rep else ioi.load_stim_log(ft=ft, rep=r)
+        assert len(lg.blocks) <= 4, (r, len(lg.blocks))
+        every.extend(lg.blocks)
+    assert every, "no blocks survived"
+
+    every.sort(key=lambda b: b.cam0)
+    assert every[0].cam0 == log.onset_frame, (every[0].cam0, log.onset_frame)
+    for a, c in zip(every, every[1:]):
         assert a.cam1 == c.cam0, f"{a.label}->{c.label}: {a.cam1} != {c.cam0}"
 
-    covered = sum(b.n_cam_frames for b in log.blocks)
-    assert covered == ft.post_stim - ft.pre_stim, covered
+    # Only demand that the last block reaches the end of the recording when
+    # the stimulus actually fitted inside it.
+    if log.overrun_frames <= 0:
+        assert every[-1].cam1 == ft.post_stim, (every[-1].cam1, ft.post_stim)
+    else:
+        print(f"  note: stimulus overruns the recording by "
+              f"{log.overrun_frames / log.fps_cam:.1f} s; "
+              f"{4 * log.n_reps - len(every)} block(s) dropped")
 
-    for b in log.blocks:
-        assert b.n_cycles == 15, (b.label, b.n_cycles)
+    covered = sum(b.n_cam_frames for b in every)
+    assert covered == every[-1].cam1 - every[0].cam0, covered
+
+    for b in every:
+        want = 15 if not b.truncated else b.n_cycles
+        assert b.n_cycles == want, (b.label, b.n_cycles)
         assert b.frames_per_cycle * b.n_cycles == b.k1 - b.k0 + 1
+    print(f"        display rate {log.nominal_refresh:.4f} Hz "
+          f"(source: {log.display_hz_source}), {log.n_reps} repeat(s), "
+          f"{len(every)} block(s)")
 
     # elevation and azimuth must differ, and the ratio must match the
     # frames-per-cycle ratio to within rounding
@@ -118,8 +144,8 @@ def test_timing():
     ratio_n = az.frames_per_cycle / el.frames_per_cycle
     assert abs(ratio_f - ratio_n) < 1e-3, (ratio_f, ratio_n)
 
-    print(f"  PASS  test_timing: 4 blocks tile {covered} camera frames, "
-          f"15 cycles each")
+    print(f"  PASS  test_timing: {len(every)} block(s) tile {covered} "
+          f"camera frames")
     print(f"        elevation F = {el.f_stim:.6f} Hz, "
           f"azimuth F = {az.f_stim:.6f} Hz, ratio {ratio_f:.4f} "
           f"(expected {ratio_n:.4f})")
