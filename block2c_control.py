@@ -232,6 +232,7 @@ def main():
 
     results = {k: metrics_for_bin(d, k, bright, valid, I) for k in K_LIST}
     _component_report(results, bright)
+    _excess_report(results, bright)
 
     print("\n" + "=" * 78)
     print("PER-BIN METRICS  (bin 15 is the stimulus; all others are controls)")
@@ -341,6 +342,77 @@ def _verdict(results, d):
         print("  signal at the stimulus frequency -- the structure seen in")
         print("  Block 2b is spatially correlated noise, which every bin has.")
         print("  No analysis can recover a map from this session.")
+
+
+def excess_map(results, k, labels=None, sigma=3.0, mask=None):
+    """
+    Where in the field does bin k respond, using AMPLITUDE only?
+
+    The sign map needs a clean per-pixel PHASE, which is far harder to get
+    than a clean amplitude -- a phase that is merely noisy rails against the
+    travel limit and poisons the gradients, while an amplitude that is merely
+    noisy still averages.  So when the phase maps are too noisy to delineate
+    anything, this still localises the responsive tissue.
+
+    For each direction it takes the residual SNR at bin k minus the mean over
+    the other bins, then averages the four directions.  Running it for every
+    bin gives its own null: the control bins show what this statistic does
+    when there is nothing there.
+    """
+    from scipy.ndimage import gaussian_filter
+    labels = LABELS if labels is None else labels
+    off = [j for j in K_LIST if j != k]
+    per = []
+    for lb in labels:
+        s_k = results[k][2][lb].snr
+        s_c = np.nanmean([results[j][2][lb].snr for j in off], axis=0)
+        per.append(s_k - s_c)
+    ex = np.nanmean(per, axis=0)
+    if mask is None:
+        return ex
+    m = mask & np.isfinite(ex)
+    den = gaussian_filter(m.astype(float), sigma)
+    num = gaussian_filter(np.where(m, np.nan_to_num(ex), 0.0), sigma)
+    out = np.full_like(ex, np.nan)
+    good = den > 1e-6
+    out[good] = num[good] / den[good]
+    return np.where(mask, out, np.nan)
+
+
+def _excess_report(results, bright, sigma=3.0, pct=99.0):
+    """Peak of the excess map at every bin -- the controls are the null."""
+    peaks, maps = {}, {}
+    for k in K_LIST:
+        ex = excess_map(results, k, sigma=sigma, mask=bright)
+        maps[k] = ex
+        peaks[k] = float(np.nanpercentile(ex[bright], pct))
+    ctrl = [peaks[k] for k in K_LIST if k != K_STIM]
+    mu, sd = float(np.mean(ctrl)), float(np.std(ctrl))
+    z = (peaks[K_STIM] - mu) / sd if sd > 0 else np.nan
+
+    print(f"\n  AMPLITUDE LOCALISER -- {pct:.0f}th pct of the smoothed "
+          f"excess SNR map (sigma {sigma:.0f} px)")
+    for k in K_LIST:
+        tag = "  <== STIMULUS" if k == K_STIM else ""
+        print(f"    bin {k:3d}  {peaks[k]:+7.3f}{tag}")
+    print(f"    stimulus {peaks[K_STIM]:+.3f}  controls {mu:+.3f} +- {sd:.3f}"
+          f"  ->  z = {z:+.2f}")
+
+    ex = maps[K_STIM]
+    thr = mu + 3 * sd
+    hot = bright & np.isfinite(ex) & (ex > thr)
+    px_mm2 = (UM_PER_PIXEL / 1000.0) ** 2
+    if hot.sum():
+        rows, cols = np.nonzero(hot)
+        print(f"    region above the control ceiling ({thr:+.3f}): "
+              f"{hot.sum()} px = {hot.sum() * px_mm2:.2f} mm2, "
+              f"centroid ({rows.mean():.0f}, {cols.mean():.0f})")
+        print("    that centroid is where the responsive cortex is, from "
+              "amplitude alone --\n    no phase, no gradients, nothing that "
+              "can rail at a travel limit.")
+    else:
+        print("    nothing above the control ceiling")
+    return maps, z
 
 
 def _component_report(results, bright, min_px=100):

@@ -52,7 +52,7 @@ BRIGHT_HI_PCT = 99.5
 # Optional rectangle in BINNED pixels, (row0, row1, col0, col1), to restrict
 # the mask -- keep this identical to the ROI used in block2c_control.py so the
 # control statistics and the maps describe the same pixels.
-ROI = None
+ROI = (0, 135, 0, 88)
 K_STIM = 15
 PHASE_SIGMA = 2.0
 DELAY_SIGMA = 4.0
