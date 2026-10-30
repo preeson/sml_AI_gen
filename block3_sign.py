@@ -48,6 +48,11 @@ OFFSET = 1540.0
 MIN_COUNTS = 500.0
 BRIGHT_LO_PCT = 60.0
 BRIGHT_HI_PCT = 99.5
+
+# Optional rectangle in BINNED pixels, (row0, row1, col0, col1), to restrict
+# the mask -- keep this identical to the ROI used in block2c_control.py so the
+# control statistics and the maps describe the same pixels.
+ROI = None
 K_STIM = 15
 PHASE_SIGMA = 2.0
 DELAY_SIGMA = 4.0
@@ -155,6 +160,13 @@ def main(paths):
     valid = I > MIN_COUNTS
     lo, hi = np.percentile(I[valid], [BRIGHT_LO_PCT, BRIGHT_HI_PCT])
     bright = valid & (I >= lo) & (I <= hi)
+    if ROI is not None:
+        r0, r1, c0, c1 = ROI
+        keep = np.zeros_like(bright)
+        keep[r0:r1, c0:c1] = True
+        before = int(bright.sum())
+        bright = bright & keep
+        print(f"\nROI {ROI}: {before} -> {int(bright.sum())} px")
     print(f"\nbright mask: {bright.sum()} px "
           f"({bright.sum()*(UM_PER_PIXEL/1000)**2:.2f} mm2)")
 
@@ -229,6 +241,7 @@ def main(paths):
 
     print("\n=== VISUAL FIELD SIGN ===")
     print(ios.report(sm, ps))
+    _sigma_sweep(el, az, bright, snr)
 
     _figure(mean_img, bright, maps, info, sm, ps)
     np.savez_compressed(
@@ -242,6 +255,39 @@ def main(paths):
         patch_areas=np.array([p.area_mm2 for p in ps]),
     )
     print(f"\nwrote {OUT_PNG} and {OUT_NPZ}")
+
+
+def _sigma_sweep(el, az, bright, snr, sigmas=(1.0, 2.0, 3.0, 4.0, 6.0, 8.0)):
+    """
+    How the patches respond to the gradient smoothing scale.
+
+    Smoothing is a knob, and a knob turned until a map appears is not
+    evidence.  Used as a measurement instead it is informative: a real
+    cortical area is a fixed piece of tissue, so its patch should GROW as
+    smoothing suppresses pixel noise and then SETTLE near its true size.
+    Noise blobs behave differently -- they keep changing area, split and
+    merge, or vanish once the smoothing exceeds their own scale.
+
+    Read the column, not any single row.  Pick a sigma from the plateau if
+    there is one, and distrust the whole thing if there isn't.
+    """
+    print("\n=== PATCH STABILITY vs GRADIENT SMOOTHING ===")
+    print(f"  {'sigma':>6}{'um':>7}{'reliable':>10}{'patches':>9}"
+          f"{'largest mm2':>13}{'sign':>6}   areas (mm2)")
+    for sg in sigmas:
+        smx = ios.visual_field_sign(el.position, az.position, bright,
+                                    um_per_pixel=UM_PER_PIXEL, sigma=sg,
+                                    snr=snr, snr_min=SNR_MIN)
+        px = ios.patches(smx)
+        areas = sorted((p.area_mm2 for p in px), reverse=True)
+        big = px[int(np.argmax([p.area_mm2 for p in px]))] if px else None
+        print(f"  {sg:6.1f}{sg * UM_PER_PIXEL:7.0f}"
+              f"{100 * smx.reliable.sum() / max(bright.sum(), 1):9.0f}%"
+              f"{len(px):9d}"
+              f"{(areas[0] if areas else 0.0):13.2f}"
+              f"{(f'{big.sign:+d}' if big is not None else '--'):>6}   "
+              + ", ".join(f"{a:.2f}" for a in areas[:5]))
+    print("  a real area grows then plateaus; noise keeps moving")
 
 
 def _figure(mean_img, bright, maps, info, sm, ps):

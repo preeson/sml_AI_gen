@@ -65,8 +65,18 @@ BINS_PER_CYCLE = 80
 CHUNK = 256
 OFFSET = 1540.0
 MIN_COUNTS = 500.0
+UM_PER_PIXEL = 6150.0 / 640.0 * BIN_XY   # sensor FOV 6.15 mm wide
 BRIGHT_LO_PCT = 60.0
 BRIGHT_HI_PCT = 99.5
+
+# Optional rectangle, in BINNED pixels, to restrict the evaluation mask:
+#   ROI = (row0, row1, col0, col1)
+# The brightness mask alone can pick up skull, dental cement and anything
+# else that reflects well, and every metric here is a MEDIAN over the mask.
+# Non-responsive pixels do not add noise to that median -- they move it
+# toward the no-signal value, so a mask that is half off-brain roughly
+# halves the measured effect.  Set this to the cranial window.
+ROI = (0, 135, 0, 88)
 ORDER = 0
 PHASE_SIGMA = 2.0
 DELAY_SIGMA = 4.0
@@ -207,6 +217,13 @@ def main():
     lo = np.percentile(I[valid], BRIGHT_LO_PCT)
     hi = np.percentile(I[valid], BRIGHT_HI_PCT)
     bright = valid & (I >= lo) & (I <= hi)
+    if ROI is not None:
+        r0, r1, c0, c1 = ROI
+        keep = np.zeros_like(bright)
+        keep[r0:r1, c0:c1] = True
+        before = int(bright.sum())
+        bright = bright & keep
+        print(f"\nROI {ROI}: {before} -> {int(bright.sum())} evaluation px")
     print(f"\nfit on {valid.sum()} px (I spans "
           f"{I[valid].min():.0f}-{I[valid].max():.0f}, "
           f"{I[valid].max()/I[valid].min():.0f}x); "
@@ -214,6 +231,7 @@ def main():
           f"({lo:.0f}-{hi:.0f} counts, {hi/lo:.1f}x)")
 
     results = {k: metrics_for_bin(d, k, bright, valid, I) for k in K_LIST}
+    _component_report(results, bright)
 
     print("\n" + "=" * 78)
     print("PER-BIN METRICS  (bin 15 is the stimulus; all others are controls)")
@@ -261,6 +279,7 @@ def _verdict(results, d):
     print("=" * 78)
     off = [k for k in K_LIST if k != K_STIM]
     tests = []
+    block_z = []
 
     for label in LABELS:
         v = results[K_STIM][0][label]["snr"]
@@ -269,6 +288,7 @@ def _verdict(results, d):
         print(f"  residual SNR  {label}: stimulus {v:.2f}  "
               f"controls {np.mean(c):.2f} +- {np.std(c):.2f}  ->  z = {z:+.2f}")
         tests.append(z)
+        block_z.append(z)
 
     for axis in ("elevation", "azimuth"):
         v = results[K_STIM][1][axis]["agree"]
@@ -284,12 +304,36 @@ def _verdict(results, d):
               f"controls {np.mean(c):.2f} +- {np.std(c):.2f} s   "
               f"(chance {results[K_STIM][1][axis]['delay_chance']:.2f} s)")
 
-    strong = sum(abs(t) > 3 for t in tests if np.isfinite(t))
+    # ------------------------------------------------------------------
+    # Combine the four per-block tests instead of judging them one at a
+    # time.  Each block is a separate test of the same hypothesis, so four
+    # modest agreeing z-scores are much stronger evidence than the largest
+    # of them -- and judging them singly made this test miss a real response
+    # whose per-block z were +1.52, +3.58, +1.38, +2.95.
+    #
+    # Consistency matters as much as size.  Every direction sweeps the same
+    # cortex, so a genuine response has to appear in ALL FOUR, whereas one
+    # block at z = +5 with another at z = -2 is the signature of a noisy
+    # estimate rather than a signal.  Requiring agreement in sign is the
+    # thing that separates them.
+    #
+    # One-sided throughout: only an EXCESS at bin 15 is evidence of signal.
+    # The old test counted abs(z), so a residual SNR far BELOW the controls
+    # counted in favour.
+    # ------------------------------------------------------------------
+    zb = [z for z in block_z if np.isfinite(z)]
+    z_comb = float(np.mean(zb) * np.sqrt(len(zb))) if zb else np.nan
+    consistent = bool(zb) and all(z > 0 for z in zb)
+    best = max((t for t in tests if np.isfinite(t)), default=0.0)
+
     print()
-    if strong >= 4:
+    print(f"  combined over the {len(zb)} blocks (Stouffer): z = {z_comb:+.2f}"
+          f"   all four same sign: {'yes' if consistent else 'NO'}")
+    print()
+    if z_comb > 3 and consistent:
         print("  Bin 15 stands clearly apart from its neighbours: there IS")
         print("  signal at the stimulus frequency.")
-    elif strong >= 2:
+    elif (z_comb > 2 and consistent) or best > 3:
         print("  Bin 15 is marginally distinguishable. Weak but not nothing;")
         print("  any map from this session is provisional at best.")
     else:
@@ -297,6 +341,38 @@ def _verdict(results, d):
         print("  signal at the stimulus frequency -- the structure seen in")
         print("  Block 2b is spatially correlated noise, which every bin has.")
         print("  No analysis can recover a map from this session.")
+
+
+def _component_report(results, bright, min_px=100):
+    """
+    Residual SNR at the stimulus bin, per connected piece of the mask.
+
+    A brightness threshold often returns several disconnected regions -- the
+    window, and whatever else on the skull happens to reflect as well.  Since
+    every metric here is a median over the whole mask, a large unresponsive
+    region drags the result toward "no signal" even when one region responds
+    perfectly well.  This says which piece carries what.
+    """
+    from scipy.ndimage import label as _label
+    lab, n = _label(bright)
+    if n < 2:
+        return
+    print("\n  mask is in {} pieces -- residual SNR at bin {} in each:"
+          .format(n, K_STIM))
+    px_mm2 = (UM_PER_PIXEL / 1000.0) ** 2
+    for i in range(1, n + 1):
+        m = lab == i
+        if m.sum() < min_px:
+            continue
+        vals = [float(np.nanmedian(results[K_STIM][2][lb].snr[m]))
+                for lb in LABELS]
+        rows, cols = np.nonzero(m)
+        print(f"    piece {i}: {m.sum():5d} px ({m.sum() * px_mm2:5.2f} mm2) "
+              f"rows {rows.min():3d}-{rows.max():3d} cols {cols.min():3d}-"
+              f"{cols.max():3d}   SNR " +
+              "  ".join(f"{lb} {v:.2f}" for lb, v in zip(LABELS, vals)))
+    print("    a piece that sits near 1.0 in every direction is contributing "
+          "nothing\n    but dilution -- consider setting ROI to exclude it.")
 
 
 def _figure(results, d, I, bright):

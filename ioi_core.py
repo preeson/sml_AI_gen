@@ -30,14 +30,14 @@ import scipy.io as sio
 # Configuration -- edit these paths for your machine
 # --------------------------------------------------------------------------
 
-DATA_DIR = r"/mnt/user-data/uploads"
+DATA_DIR = r"\\157.136.61.135\eq-gbouvier\Patrick\IOS Testing\SST-Ai9_G3_temp_control\short wrapped\29-Oct-2026"
 
 DAT_PATH = os.path.join(DATA_DIR, "Frames_1_640_540_uint16_0001.dat")
 FRAMETIMES_PATH = os.path.join(DATA_DIR, "frameTimes_0001.mat")
 ANALOG_PATH = os.path.join(DATA_DIR, "Analog_1.dat")
 STIMLOG_PATH = os.path.join(
     DATA_DIR,
-    "260909145607-KSstimAllDir-Mc57-M1_trial1-plr-plr-notTriggered-complete.pkl",
+    "261029193952-KSstimAllDir-MSST-Ai9_G3_Wrap-plr-plr-notTriggered-complete.pkl",
 )
 
 FRAME_H = 540           # rows,    = imgSize(1)
@@ -56,7 +56,9 @@ class FrameTimes:
     t: np.ndarray          # seconds, relative to first frame
     n_frames: int
     pre_stim: int          # number of baseline frames before stimulus onset
-    post_stim: int         # first camera frame index *after* the stimulus
+    post_stim: int         # first camera frame index after the stimulus
+                           # (MATLAB stores a COUNT; load_frame_times
+                           #  converts it to an index -- see there)
     removed: int
     datenum0: float        # original MATLAB datenum of frame 0
 
@@ -72,14 +74,32 @@ class FrameTimes:
 
 
 def load_frame_times(path: str | None = None) -> FrameTimes:
+    """
+    Read frameTimes_NNNN.mat and put both stimulus markers on the same
+    footing, as CAMERA FRAME INDICES.
+
+    WidefieldImager saves them with different meanings:
+
+        preStim  = bIdx                  -- a count, and also the index of
+                                            the first post-stimulus frame
+        postStim = size(Data,4) - bIdx   -- a COUNT of frames after it
+
+    so postStim is not an index into the movie.  While the baseline was
+    switched off, preStim was 0 and the two happened to coincide, which hid
+    the difference; with a real baseline they differ by exactly preStim and
+    every "does the last block reach post_stim" check fails by that much.
+    Convert once, here, so the rest of the pipeline can treat both as indices.
+    """
     m = sio.loadmat(_require(FRAMETIMES_PATH if path is None else path))
     ft = np.asarray(m["frameTimes"], dtype=np.float64).ravel()
     t = (ft - ft[0]) * 86400.0  # MATLAB datenum is in days
+    pre = int(np.asarray(m["preStim"]).ravel()[0])
+    n_post = int(np.asarray(m["postStim"]).ravel()[0])
     return FrameTimes(
         t=t,
         n_frames=t.size,
-        pre_stim=int(np.asarray(m["preStim"]).ravel()[0]),
-        post_stim=int(np.asarray(m["postStim"]).ravel()[0]),
+        pre_stim=pre,
+        post_stim=min(pre + n_post, t.size),
         removed=int(np.asarray(m["removedFrames"]).ravel()[0]),
         datenum0=float(ft[0]),
     )

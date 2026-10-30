@@ -119,7 +119,17 @@ def test_timing():
     # Only demand that the last block reaches the end of the recording when
     # the stimulus actually fitted inside it.
     if log.overrun_frames <= 0:
-        assert every[-1].cam1 == ft.post_stim, (every[-1].cam1, ft.post_stim)
+        # The camera clock and the display clock are measured independently,
+        # so they disagree by a few hundred ppm -- ordinary crystal tolerance.
+        # Demanding exact equality fails on a perfectly good recording.
+        span = every[-1].cam1 - every[0].cam0
+        slack = max(10.0, 0.001 * span)
+        off = abs(every[-1].cam1 - ft.post_stim)
+        assert off <= slack, (every[-1].cam1, ft.post_stim,
+                              f"{off} frames = {off / span * 1e6:.0f} ppm")
+        if off:
+            print(f"  note: last block ends {off} frames from post_stim "
+                  f"({off / span * 1e6:.0f} ppm clock disagreement)")
     else:
         print(f"  note: stimulus overruns the recording by "
               f"{log.overrun_frames / log.fps_cam:.1f} s; "

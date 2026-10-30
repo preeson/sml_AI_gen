@@ -89,8 +89,14 @@ def main():
         print(f"  display_iter = {log.n_reps} -> {log.n_reps} independent "
               f"trials in this recording, {4 * log.n_reps} blocks")
     print()
+    print(f"  camera {log.fps_cam:.4f} Hz (own clock) / display "
+          f"{log.nominal_refresh:g} Hz -> {log.fps_cam/log.nominal_refresh:.4f} "
+          f"camera frames per stimulus frame; stimulus frame 0 at camera "
+          f"frame {log.onset_frame}")
+    print(f"  {log.coverage}")
+    print()
     hdr = (f"  {'rep':<4}{'blk':<5}{'axis':<11}{'cam frames':<20}{'dur (s)':>9}"
-           f"{'cyc':>5}{'F (Hz)':>10}{'bar centre (deg)':>22}{'screen':>9}")
+           f"{'cyc':>5}{'F (Hz)':>10}{'bar centre (deg)':>22}{'screen':>9}  state")
     print(hdr)
     every = []
     for r in range(log.n_reps):
@@ -100,8 +106,14 @@ def main():
                   f"{f'{b.cam0}-{b.cam1}':<20}{b.duration:9.2f}"
                   f"{b.n_cycles:5d}{b.f_stim:10.6f}"
                   f"{f'{b.bar_deg_first:+.1f} -> {b.bar_deg_last:+.1f}':>22}"
-                  f"{f'+-{b.visible_half:.1f}':>9}")
+                  f"{f'+-{b.visible_half:.1f}':>9}"
+                  + ("  TRUNCATED %d/%d" % (b.n_cycles, b.n_cycles_designed)
+                     if b.truncated else "  ok"))
             every.append(b)
+        missing = [x for x in ("B2U", "U2B", "L2R", "R2L")
+                   if x not in {b.label for b in lg.blocks}]
+        for x in missing:
+            print(f"  {r:<4}{x:<5}{'--':<11}{'not recorded':<20}")
 
     # contiguity / containment, across every repeat
     ok = True
@@ -115,12 +127,21 @@ def main():
         print(f"  !! first block starts at {every[0].cam0}, "
               f"expected {ft.pre_stim}")
         ok = False
-    if every[-1].cam1 != ft.post_stim:
-        print(f"  !! last block ends at {every[-1].cam1}, "
-              f"expected {ft.post_stim}")
-        ok = False
+    if log.overrun_frames <= 0 and every[-1].cam1 != ft.post_stim:
+        off = abs(every[-1].cam1 - ft.post_stim)
+        span = every[-1].cam1 - every[0].cam0
+        ppm = off / span * 1e6
+        if ppm <= 1000:
+            print(f"  last block ends {off} frames from post_stim "
+                  f"({ppm:.0f} ppm) -- normal disagreement between the "
+                  f"camera and display clocks")
+        else:
+            print(f"  !! last block ends at {every[-1].cam1}, expected "
+                  f"{ft.post_stim} ({ppm:.0f} ppm -- too large to be clock drift)")
+            ok = False
     if ok:
-        print(f"  OK: {len(every)} blocks tile the stimulus window exactly.")
+        print(f"  OK: {len(every)} recorded block(s) tile their span with no "
+              f"gap or overlap.")
 
     # ---- 4. pixel layout -------------------------------------------------
     rule("4. Pixel layout")
