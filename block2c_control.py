@@ -76,7 +76,7 @@ BRIGHT_HI_PCT = 99.5
 # Non-responsive pixels do not add noise to that median -- they move it
 # toward the no-signal value, so a mask that is half off-brain roughly
 # halves the measured effect.  Set this to the cranial window.
-ROI = (0, 135, 0, 88)
+ROI = (26, 79, 33, 86)
 ORDER = 0
 PHASE_SIGMA = 2.0
 DELAY_SIGMA = 4.0
