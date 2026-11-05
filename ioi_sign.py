@@ -51,6 +51,68 @@ def _smooth_masked(x, mask, sigma):
     return num / np.where(den > 1e-6, den, np.nan)
 
 
+def _smooth_phasor(x, mask, sigma, period, weight=None, eps=1e-9):
+    """
+    Weighted circular smoothing of a position map, returned as a phasor.
+
+    Two things are wrong with smoothing position in degrees, and both of them
+    show up as stripes in the sign map.
+
+    IT IS CIRCULAR.  Position is read from a phase, so it is periodic over the
+    bar travel: a pixel at +59 deg and its neighbour at -59 deg are adjacent on
+    the stimulus, not 118 deg apart.  Averaging them linearly puts the boundary
+    pixel at 0, inventing a steep gradient where the map is actually smooth.
+
+    IT IS UNWEIGHTED.  A pixel whose phase is noise gets the same vote as a
+    pixel with SNR 6.  Outside the responsive region that is most of them, and
+    the local average becomes an average of noise -- which is why restricting
+    the mask by hand appeared to be the only thing that worked.
+
+    Smoothing w.exp(2.pi.i.P/period) and dividing by the smoothed w fixes both.
+    The modulus of the result is the local agreement of the neighbourhood,
+    0 where neighbours disagree and 1 where they concur, which is a free and
+    much better-founded reliability measure than a gradient percentile.
+    """
+    w = np.zeros(np.shape(x), dtype=float) if weight is None else \
+        np.asarray(weight, dtype=float)
+    if weight is None:
+        w[...] = 1.0
+    w = np.where(mask & np.isfinite(x) & np.isfinite(w), np.maximum(w, 0.0), 0.0)
+    z = w * np.exp(2j * np.pi * np.nan_to_num(np.asarray(x, dtype=float))
+                   / period)
+    if sigma is not None and sigma > 0:
+        zs = (gaussian_filter(z.real, sigma)
+              + 1j * gaussian_filter(z.imag, sigma))
+        ws = gaussian_filter(w, sigma)
+    else:
+        zs, ws = z, w
+    good = ws > eps
+    return np.where(good, zs / np.where(good, ws, 1.0), np.nan + 0j)
+
+
+def _phasor_gradient(zs, period):
+    """
+    Spatial gradient of a circular map, taken through its phasor so that the
+    wrap cannot produce a gradient.
+
+    For a unit phasor u = exp(i.phi), Im(conj(u) . du) = dphi exactly in the
+    continuum, and with finite differences it returns the mean of the sines of
+    the one-sided phase steps.  Small steps give the ordinary central
+    difference; a step near half a cycle SATURATES instead of jumping by a
+    full cycle.  np.gradient on the degrees cannot do this: at every wrap it
+    reports a gradient the size of the whole travel, and since VFS is built
+    from the ANGLE between two gradients, one wrap line in azimuth flips the
+    sign along its whole length.  That is the mechanism behind the stripes.
+
+    Returns (d/drow, d/dcol) in degrees of visual angle per pixel.
+    """
+    a = np.abs(zs)
+    u = np.where(a > 0, zs / np.where(a > 0, a, 1.0), np.nan + 0j)
+    uy, ux = np.gradient(u)
+    k = period / (2.0 * np.pi)
+    return (np.imag(np.conj(u) * uy) * k, np.imag(np.conj(u) * ux) * k)
+
+
 @dataclass
 class SignMap:
     vfs: np.ndarray          # (h, w) sine of the gradient angle, -1..1
@@ -62,13 +124,19 @@ class SignMap:
     grad_mag_el: np.ndarray
     grad_mag_az: np.ndarray
     um_per_pixel: float
+    coherence: np.ndarray | None = None  # (h, w) 0..1, local agreement of the
+                                         # position maps; None on the legacy
+                                         # (unweighted, linear) path
+    weighted: bool = False
 
 
 def visual_field_sign(elevation, azimuth, mask, um_per_pixel: float,
                       sigma: float = 3.0, snr=None,
                       min_grad_pct: float = 25.0,
                       min_abs_sin: float = 0.35,
-                      snr_min: float = 3.0) -> SignMap:
+                      snr_min: float = 3.0,
+                      period=None, weight=None,
+                      min_coherence: float = 0.0) -> SignMap:
     """
     elevation, azimuth : position maps in degrees
     mask               : where those maps are valid
@@ -81,12 +149,33 @@ def visual_field_sign(elevation, azimuth, mask, um_per_pixel: float,
     min_abs_sin        : reject pixels whose |VFS| is below this -- the
                          near-degenerate gradient pairs that cause stripes
     snr, snr_min       : optional extra gate on the underlying map SNR
+    period             : the bar travel in degrees, per axis, as
+                         {'elevation': deg, 'azimuth': deg} or a single number.
+                         Supplying it switches on circular, weighted smoothing
+                         and wrap-safe gradients, which is what you want on
+                         real data; leaving it None keeps the original linear
+                         unweighted behaviour (used by the regression tests).
+    weight             : per-pixel weight for that smoothing, normally the map
+                         SNR.  Defaults to uniform.
+    min_coherence      : reject pixels whose neighbourhood disagrees about
+                         position by more than this.  Only meaningful with
+                         `period`; 0 disables it.
     """
-    e = _smooth_masked(elevation, mask, sigma)
-    a = _smooth_masked(azimuth, mask, sigma)
-
-    gey, gex = np.gradient(e)
-    gay, gax = np.gradient(a)
+    coherence = None
+    weighted = period is not None
+    if not weighted:
+        e = _smooth_masked(elevation, mask, sigma)
+        a = _smooth_masked(azimuth, mask, sigma)
+        gey, gex = np.gradient(e)
+        gay, gax = np.gradient(a)
+    else:
+        per = period if isinstance(period, dict) else \
+            {"elevation": float(period), "azimuth": float(period)}
+        ze = _smooth_phasor(elevation, mask, sigma, per["elevation"], weight)
+        za = _smooth_phasor(azimuth, mask, sigma, per["azimuth"], weight)
+        gey, gex = _phasor_gradient(ze, per["elevation"])
+        gay, gax = _phasor_gradient(za, per["azimuth"])
+        coherence = np.sqrt(np.abs(ze) * np.abs(za))
     mag_e = np.hypot(gey, gex)
     mag_a = np.hypot(gay, gax)
 
@@ -96,26 +185,47 @@ def visual_field_sign(elevation, azimuth, mask, um_per_pixel: float,
     ok = mask & np.isfinite(vfs) & np.isfinite(mag_e) & np.isfinite(mag_a)
     if ok.sum() == 0:
         raise ValueError("no valid pixels for the sign map")
-    ge_thr = np.percentile(mag_e[ok], min_grad_pct)
-    ga_thr = np.percentile(mag_a[ok], min_grad_pct)
+    # The flatness gate must be calibrated on pixels we believe, not on the
+    # whole mask.  A noise pixel's position is random, so its gradient is as
+    # large as the travel allows -- in a mask that is mostly unresponsive, the
+    # 25th percentile of |grad| over everything lands ABOVE the gradient of
+    # genuine, smooth retinotopy, and the gate then throws away exactly the
+    # pixels it exists to protect.  Taking the percentile over the believable
+    # subset asks the intended question: of the pixels with a real response,
+    # which are the flattest?
+    ref = ok.copy()
+    if snr is not None and snr_min > 0:
+        ref = ref & (np.nan_to_num(snr) >= snr_min)
+    if coherence is not None and min_coherence > 0:
+        ref = ref & (np.nan_to_num(coherence) >= min_coherence)
+    if ref.sum() < max(50, 0.02 * ok.sum()):
+        ref = ok
+    ge_thr = np.percentile(mag_e[ref], min_grad_pct)
+    ga_thr = np.percentile(mag_a[ref], min_grad_pct)
 
     rel_sin = np.abs(vfs)
     rel_grad = np.minimum(mag_e / max(ge_thr, 1e-12),
                           mag_a / max(ga_thr, 1e-12))
     rel_grad = np.clip(rel_grad, 0, 1)
-    reliability = np.where(ok, rel_sin * rel_grad, np.nan)
+    rel = rel_sin * rel_grad
+    if coherence is not None:
+        rel = rel * np.clip(np.nan_to_num(coherence), 0.0, 1.0)
+    reliability = np.where(ok, rel, np.nan)
 
     reliable = ok & (np.abs(vfs) >= min_abs_sin) & \
         (mag_e >= ge_thr) & (mag_a >= ga_thr)
     if snr is not None:
         reliable &= (snr >= snr_min)
+    if coherence is not None and min_coherence > 0:
+        reliable &= (np.nan_to_num(coherence) >= min_coherence)
 
     return SignMap(vfs=np.where(ok, vfs, np.nan), angle=np.where(ok, ang, np.nan),
                    reliability=reliability,
                    gated=np.where(reliable, vfs, np.nan),
                    mask=ok, reliable=reliable,
                    grad_mag_el=mag_e, grad_mag_az=mag_a,
-                   um_per_pixel=um_per_pixel)
+                   um_per_pixel=um_per_pixel,
+                   coherence=coherence, weighted=weighted)
 
 
 @dataclass

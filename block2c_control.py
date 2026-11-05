@@ -59,6 +59,7 @@ import ioi_core as ioi
 import ioi_fourier as iof
 import ioi_leak as iol
 import ioi_maps as iom
+import ioi_tissue as iot
 
 BIN_XY = 4
 BINS_PER_CYCLE = 80
@@ -69,14 +70,23 @@ UM_PER_PIXEL = 6150.0 / 640.0 * BIN_XY   # sensor FOV 6.15 mm wide
 BRIGHT_LO_PCT = 60.0
 BRIGHT_HI_PCT = 99.5
 
-# Optional rectangle, in BINNED pixels, to restrict the evaluation mask:
-#   ROI = (row0, row1, col0, col1)
-# The brightness mask alone can pick up skull, dental cement and anything
-# else that reflects well, and every metric here is a MEDIAN over the mask.
-# Non-responsive pixels do not add noise to that median -- they move it
-# toward the no-signal value, so a mask that is half off-brain roughly
-# halves the measured effect.  Set this to the cranial window.
-ROI = (26, 79, 33, 86)
+# THE EVALUATION MASK
+# -------------------
+# Every metric below is a MEDIAN over the mask, and non-responsive pixels do
+# not add noise to a median -- they move it toward the no-signal value.  A mask
+# that is half off-brain roughly halves the measured effect, which is how a
+# real response came to look marginal for weeks.
+#
+# The mask therefore comes from block0c_mask.py, which measures which pixels
+# have a cardiac pulse.  Run that first; it writes tissue_mask.npz and this
+# script picks it up.  If there is no such file the old brightness band is used
+# and the printout says so.
+#
+# ROI is a manual override, a rectangle in BINNED pixels (row0, row1, col0,
+# col1), applied on top of whatever mask is in use.  With a measured mask it
+# should be None -- a hand-drawn box has to be redrawn for every animal and
+# cannot be audited.
+ROI = None
 ORDER = 0
 PHASE_SIGMA = 2.0
 DELAY_SIGMA = 4.0
@@ -214,21 +224,17 @@ def main():
 
     I = d["B2U_mean"] - OFFSET
     valid = I > MIN_COUNTS
-    lo = np.percentile(I[valid], BRIGHT_LO_PCT)
-    hi = np.percentile(I[valid], BRIGHT_HI_PCT)
-    bright = valid & (I >= lo) & (I <= hi)
-    if ROI is not None:
-        r0, r1, c0, c1 = ROI
-        keep = np.zeros_like(bright)
-        keep[r0:r1, c0:c1] = True
-        before = int(bright.sum())
-        bright = bright & keep
-        print(f"\nROI {ROI}: {before} -> {int(bright.sum())} evaluation px")
-    print(f"\nfit on {valid.sum()} px (I spans "
+    print()
+    bright, how = iot.evaluation_mask(
+        d["B2U_mean"], bin_xy=BIN_XY, um_per_pixel=UM_PER_PIXEL,
+        offset=OFFSET, min_counts=MIN_COUNTS,
+        bright_lo=BRIGHT_LO_PCT, bright_hi=BRIGHT_HI_PCT, roi=ROI)
+    # The common-mode fit still uses the whole illuminated field: 1/I varies
+    # only a few-fold inside the mask, which made the fit ill-conditioned, so
+    # it is FITTED broadly and only EVALUATED on the mask.
+    print(f"  common-mode fit on {valid.sum()} px (I spans "
           f"{I[valid].min():.0f}-{I[valid].max():.0f}, "
-          f"{I[valid].max()/I[valid].min():.0f}x); "
-          f"evaluate on {bright.sum()} bright px "
-          f"({lo:.0f}-{hi:.0f} counts, {hi/lo:.1f}x)")
+          f"{I[valid].max()/I[valid].min():.0f}x)")
 
     results = {k: metrics_for_bin(d, k, bright, valid, I) for k in K_LIST}
     _component_report(results, bright)
@@ -424,6 +430,12 @@ def _component_report(results, bright, min_px=100):
     every metric here is a median over the whole mask, a large unresponsive
     region drags the result toward "no signal" even when one region responds
     perfectly well.  This says which piece carries what.
+
+    With a measured pulse mask (block0c_mask.py) this should normally print
+    nothing, because the mask is one region by construction.  If it still
+    reports several pieces, they are all pulsing tissue -- so the right
+    response is to ask why one of them does not respond to the stimulus, not
+    to exclude it.
     """
     from scipy.ndimage import label as _label
     lab, n = _label(bright)
@@ -444,7 +456,9 @@ def _component_report(results, bright, min_px=100):
               f"{cols.max():3d}   SNR " +
               "  ".join(f"{lb} {v:.2f}" for lb, v in zip(LABELS, vals)))
     print("    a piece that sits near 1.0 in every direction is contributing "
-          "nothing\n    but dilution -- consider setting ROI to exclude it.")
+          "nothing but\n    dilution.  If the mask came from block0c_mask.py "
+          "that piece is still perfused\n    cortex, so it is a visual-drive "
+          "question, not a masking one.")
 
 
 def _figure(results, d, I, bright):

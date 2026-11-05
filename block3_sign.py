@@ -29,6 +29,20 @@ Three changes from Block 2, each aimed at the sign map:
    the azimuth and elevation gradients are near-parallel.  Those pixels get no
    sign rather than an arbitrary one.
 
+4. A MEASURED MASK, AND WEIGHTED CIRCULAR SMOOTHING.  Two failures that look
+   like one.  The mask used to be a brightness band, which cannot tell cortex
+   from skull or cement, so it is now measured from the cardiac pulse
+   (block0c_mask.py).  And the position maps used to be smoothed in degrees,
+   unweighted, which is wrong twice over: position is periodic over the bar
+   travel, so linear averaging invents a steep gradient at every wrap, and an
+   unweighted average lets a pixel whose phase is noise outvote a pixel with
+   SNR 6.  The SNR gate downstream removed those pixels from the final map but
+   not from the smoothing that fed the gradients, so the damage reached a
+   kernel's width inside the responsive border.  Both are fixed by smoothing
+   the SNR-weighted phasor and taking gradients through it.  On synthetic data
+   with a V1-sized responsive region in a larger mask this moves the sign
+   correct inside that region from 62% to 100%.
+
 Point it at one or more components_bins.npz files for the SAME animal.
 """
 
@@ -43,22 +57,40 @@ import matplotlib.pyplot as plt
 import ioi_core as ioi
 import ioi_maps as iom
 import ioi_sign as ios
+import ioi_tissue as iot
 
 OFFSET = 1540.0
 MIN_COUNTS = 500.0
 BRIGHT_LO_PCT = 60.0
 BRIGHT_HI_PCT = 99.5
 
-# Optional rectangle in BINNED pixels, (row0, row1, col0, col1), to restrict
-# the mask -- keep this identical to the ROI used in block2c_control.py so the
-# control statistics and the maps describe the same pixels.
-ROI = (26, 79, 33, 86)
+# The mask comes from block0c_mask.py (tissue_mask.npz), measured from the
+# animal's pulse.  ROI is a manual override only -- a rectangle in BINNED
+# pixels, (row0, row1, col0, col1) -- and should normally be None.  If you do
+# set it, set the same value in block2c_control.py so the control statistics
+# and the maps describe the same pixels.
+ROI = None
 K_STIM = 15
 PHASE_SIGMA = 2.0
 DELAY_SIGMA = 4.0
 GRAD_SIGMA = 3.0
 USE_JOINT_DELAY = False   # see the module docstring before turning this on
 SNR_MIN = 3.0
+
+# Circular, SNR-weighted smoothing with wrap-safe gradients.  See
+# ioi_sign._smooth_phasor for why the alternative is wrong; set this False only
+# to reproduce an older figure.
+WEIGHTED_SIGN = True
+MIN_COHERENCE = 0.3       # reject pixels whose neighbourhood disagrees about
+                          # position; 0 disables.  Only used when WEIGHTED_SIGN.
+# Flatness gate, as a percentile of |grad| over the believable pixels.  The
+# legacy default of 25 was carrying the whole burden of rejecting noise, and it
+# costs real area: on a synthetic region of known size it returned 52% of the
+# true area at 25 and 80% at 10, while a pure-noise field gave 0.00 mm2 at
+# every setting -- because with weighting it is the COHERENCE gate that
+# rejects noise, and the flatness gate is then just attrition.  Only applied on
+# the weighted path, where that coherence gate exists.
+MIN_GRAD_PCT = 10.0
 BIN_XY = 4
 UM_PER_PIXEL = 6150.0 / 640.0 * BIN_XY
 
@@ -103,7 +135,8 @@ def circular_mean_positions(positions, travel, p0, weights=None):
         weights = [np.ones_like(positions[0])] * len(positions)
     num = sum(w * z for w, z in zip(weights, zs))
     den = sum(weights)
-    z = num / np.where(den > 0, den, np.nan)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = num / np.where(den > 0, den, np.nan)
     frac = np.mod(np.angle(z) / (2 * np.pi) - p0 / travel, 1.0)
     return p0 + frac * travel, np.abs(z)
 
@@ -156,19 +189,11 @@ def main(paths):
     trials = load_trials(paths)
     mean_img = np.mean([t[2] for t in trials], axis=0)
 
-    I = mean_img - OFFSET
-    valid = I > MIN_COUNTS
-    lo, hi = np.percentile(I[valid], [BRIGHT_LO_PCT, BRIGHT_HI_PCT])
-    bright = valid & (I >= lo) & (I <= hi)
-    if ROI is not None:
-        r0, r1, c0, c1 = ROI
-        keep = np.zeros_like(bright)
-        keep[r0:r1, c0:c1] = True
-        before = int(bright.sum())
-        bright = bright & keep
-        print(f"\nROI {ROI}: {before} -> {int(bright.sum())} px")
-    print(f"\nbright mask: {bright.sum()} px "
-          f"({bright.sum()*(UM_PER_PIXEL/1000)**2:.2f} mm2)")
+    print()
+    bright, how = iot.evaluation_mask(
+        mean_img, bin_xy=BIN_XY, um_per_pixel=UM_PER_PIXEL,
+        offset=OFFSET, min_counts=MIN_COUNTS,
+        bright_lo=BRIGHT_LO_PCT, bright_hi=BRIGHT_HI_PCT, roi=ROI)
 
     # ---- per-trial maps -------------------------------------------------
     per_trial = []
@@ -198,10 +223,12 @@ def main(paths):
 
     use = 0 if USE_JOINT_DELAY else 2
     maps = {}
+    periods = {}
     print("\n=== POSITION (averaged across recordings) ===")
     for axis, f, _ in PAIRS:
         b0 = trials[0][1][f]
         travel = abs(b0.bar_deg_last - b0.bar_deg_first)
+        periods[axis] = travel
         p0 = min(b0.bar_deg_first, b0.bar_deg_last)
         poss = [pt[use][axis].position for pt in per_trial]
         wts = [np.where(bright & np.isfinite(pt[use][axis].snr),
@@ -234,19 +261,33 @@ def main(paths):
 
     el, az = maps["elevation"], maps["azimuth"]
     snr = np.sqrt(el.snr * az.snr)
+    kw = _sign_kwargs(periods, snr)
     sm = ios.visual_field_sign(el.position, az.position, bright,
                                um_per_pixel=UM_PER_PIXEL, sigma=GRAD_SIGMA,
-                               snr=snr, snr_min=SNR_MIN)
+                               snr=snr, snr_min=SNR_MIN, **kw)
     ps = ios.patches(sm)
 
     print("\n=== VISUAL FIELD SIGN ===")
+    if WEIGHTED_SIGN:
+        print(f"  circular SNR-weighted smoothing, wrap-safe gradients; "
+              f"periods {periods['elevation']:.1f} / "
+              f"{periods['azimuth']:.1f} deg")
+        print(f"  position coherence: median "
+              f"{np.nanmedian(sm.coherence[bright]):.2f} over the mask, "
+              f"{100*np.nanmean(np.nan_to_num(sm.coherence)[bright] >= MIN_COHERENCE):.0f}% "
+              f"above {MIN_COHERENCE:g}")
+    else:
+        print("  WEIGHTED_SIGN is off -- linear unweighted smoothing")
     print(ios.report(sm, ps))
-    _sigma_sweep(el, az, bright, snr)
+    _sigma_sweep(el, az, bright, snr, kw=kw)
 
     _figure(mean_img, bright, maps, info, sm, ps)
     np.savez_compressed(
         OUT_NPZ, vfs=sm.vfs, gated=sm.gated, reliable=sm.reliable,
         reliability=sm.reliability, mask=bright,
+        coherence=(sm.coherence if sm.coherence is not None
+                   else np.zeros_like(sm.vfs)),
+        weighted=np.array(sm.weighted), mask_source=np.array(how),
         elevation_position=el.position, azimuth_position=az.position,
         delay=info["delay_joint"], snr=snr, mean_image=mean_img,
         um_per_pixel=UM_PER_PIXEL,
@@ -257,7 +298,16 @@ def main(paths):
     print(f"\nwrote {OUT_PNG} and {OUT_NPZ}")
 
 
-def _sigma_sweep(el, az, bright, snr, sigmas=(1.0, 2.0, 3.0, 4.0, 6.0, 8.0)):
+def _sign_kwargs(periods, snr):
+    """Arguments that switch on circular, weighted, wrap-safe sign mapping."""
+    if not WEIGHTED_SIGN:
+        return {}
+    return {"period": periods, "weight": np.nan_to_num(snr),
+            "min_coherence": MIN_COHERENCE, "min_grad_pct": MIN_GRAD_PCT}
+
+
+def _sigma_sweep(el, az, bright, snr, kw=None,
+                 sigmas=(1.0, 2.0, 3.0, 4.0, 6.0, 8.0)):
     """
     How the patches respond to the gradient smoothing scale.
 
@@ -277,7 +327,7 @@ def _sigma_sweep(el, az, bright, snr, sigmas=(1.0, 2.0, 3.0, 4.0, 6.0, 8.0)):
     for sg in sigmas:
         smx = ios.visual_field_sign(el.position, az.position, bright,
                                     um_per_pixel=UM_PER_PIXEL, sigma=sg,
-                                    snr=snr, snr_min=SNR_MIN)
+                                    snr=snr, snr_min=SNR_MIN, **(kw or {}))
         px = ios.patches(smx)
         areas = sorted((p.area_mm2 for p in px), reverse=True)
         big = px[int(np.argmax([p.area_mm2 for p in px]))] if px else None
@@ -318,10 +368,15 @@ def _figure(mean_img, bright, maps, info, sm, ps):
     a.set_title("sign map, ungated")
 
     a = ax[1, 1]
-    im = a.imshow(np.where(bright, sm.reliability, np.nan), cmap="cividis",
-                  vmin=0, vmax=1)
+    if sm.coherence is not None:
+        im = a.imshow(np.where(bright, sm.coherence, np.nan), cmap="cividis",
+                      vmin=0, vmax=1)
+        a.set_title("position coherence\n(do neighbours agree?)")
+    else:
+        im = a.imshow(np.where(bright, sm.reliability, np.nan), cmap="cividis",
+                      vmin=0, vmax=1)
+        a.set_title("gradient reliability")
     plt.colorbar(im, ax=a)
-    a.set_title("gradient reliability")
 
     a = ax[1, 2]
     im = a.imshow(sm.gated, cmap="bwr", vmin=-1, vmax=1)

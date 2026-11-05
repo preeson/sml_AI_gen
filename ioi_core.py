@@ -30,14 +30,14 @@ import scipy.io as sio
 # Configuration -- edit these paths for your machine
 # --------------------------------------------------------------------------
 
-DATA_DIR = r"\\157.136.61.135\eq-gbouvier\Patrick\IOS Testing\SST-Ai9_G3_temp_control\short wrapped\29-Oct-2026"
+DATA_DIR = r"\\157.136.61.135\eq-gbouvier\Patrick\HeadTilt\data\IOS\SST-Ai9_H4\MappingParadigm\02-Nov-2026"
 
 DAT_PATH = os.path.join(DATA_DIR, "Frames_1_640_540_uint16_0001.dat")
 FRAMETIMES_PATH = os.path.join(DATA_DIR, "frameTimes_0001.mat")
 ANALOG_PATH = os.path.join(DATA_DIR, "Analog_1.dat")
 STIMLOG_PATH = os.path.join(
     DATA_DIR,
-    "261029193952-KSstimAllDir-MSST-Ai9_G3_Wrap-plr-plr-notTriggered-complete.pkl",
+    "261102161312-KSstimAllDir-MSST-Ai9_H4-plr-plr-notTriggered-complete.pkl",
 )
 
 FRAME_H = 540           # rows,    = imgSize(1)
