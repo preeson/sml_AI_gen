@@ -84,7 +84,7 @@ def main():
 
 
 def _figure(tm, bright):
-    fig, ax = plt.subplots(1, 4, figsize=(21, 5))
+    fig, ax = plt.subplots(1, 5, figsize=(26, 5))
 
     a = ax[0]
     a.imshow(tm.mean_img, cmap="gray")
@@ -128,8 +128,27 @@ def _figure(tm, bright):
     a.set_title(f"cardiac amplitude\n(HR {tm.f_pulse*60:.0f}/min, "
                 f"RR {tm.f_resp*60:.0f}/min)", fontsize=9)
 
+    a = ax[4]
+    if tm.cardiac_phase is not None and tm.lit is not None:
+        ph = np.where(tm.lit, tm.cardiac_phase, np.nan)
+        a.imshow(ph, cmap="twilight", vmin=-np.pi, vmax=np.pi)
+        a.contour(tm.mask.astype(float), levels=[0.5], colors="k",
+                  linewidths=0.8)
+        axial = (tm.phase_m2 > 2.5 * tm.phase_m1 and tm.phase_m2 > 0.4)
+        a.set_title(f"phase at the heart rate\nm1 {tm.phase_m1:.2f} / m2 "
+                    f"{tm.phase_m2:.2f} -> "
+                    f"{'TWO LOBES: motion' if axial else 'one lobe: perfusion'}",
+                    fontsize=9)
+    else:
+        a.axis("off")
+
+    fr = tm.frac or {}
+    sub = (f"   |   cardiac map {100*fr.get('uniform', float('nan')):.0f}% "
+           f"uniform / {100*fr.get('motion', float('nan')):.0f}% motion / "
+           f"{100*fr.get('structured', float('nan')):.0f}% structured"
+           if fr else "")
     fig.suptitle(f"Block 0c -- evaluation mask measured from the pulse "
-                 f"[{tm.method}]")
+                 f"[{tm.method}]{sub}")
     fig.tight_layout()
     fig.savefig(OUT_PNG, dpi=110)
     plt.close(fig)

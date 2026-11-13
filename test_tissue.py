@@ -13,9 +13,7 @@ import numpy as np
 import ioi_core as ioi
 import ioi_tissue as iot
 
-H, W, BIN = 120, 160, 2   # binned 60x80, window radius 20 px: the
-                         # kernel and the erosion must be small next to the
-                         # window, as they are on the real 135x160 fields
+H, W, BIN = 120, 160, 2   # binned 60x80, window radius 20 px
 FS = 100.0
 N = 2000
 F_HR = 7.3          # Hz, 438/min
@@ -192,10 +190,9 @@ def test_parenchyma_is_recovered_not_just_the_vasculature():
               f"fpr {100*fpr:4.1f}%, method {tm.method}, "
               f"threshold {tm.threshold:.2f}x")
 
-    d = iot.SMOOTH_SIGMA
     assert out[0.0][0] < 0.35, ("unsmoothed should find little more than the "
                                 "vessels", out[0.0][0])
-    # monotone in the smoothing scale, and the shipped default must work
+    d = iot.SMOOTH_SIGMA
     rec = [out[s][0] for s in (0.0, 1.0, 2.0, 3.0)]
     assert all(b >= a - 0.02 for a, b in zip(rec, rec[1:])), rec
     assert out[d][0] > 0.85, (d, out[d][0])
@@ -233,6 +230,78 @@ def test_global_detector_uses_the_coherent_mean():
     assert tm.method == "cardiac", tm.method
     assert abs(tm.f_pulse - F_HR) < 0.1, tm.f_pulse
     print("  PASS  test_global_detector_uses_the_coherent_mean")
+
+
+def _shifted(img, dx, dy):
+    """Sub-pixel rigid shift, used to synthesise a motion artefact."""
+    from scipy.ndimage import shift as ndshift
+    return ndshift(img, (dy, dx), order=1, mode="nearest")
+
+
+def test_motion_artefact_is_identified_and_removed():
+    """
+    A preparation that MOVES at the heart rate produces a field-wide signal at
+    the heart rate with no blood involved.  Every pixel passes, the mask keeps
+    the whole frame, and the result is worthless.  This is the failure that a
+    67%-coverage mask with a unimodal histogram looks like.
+
+    Here the entire image is rigidly displaced by 0.15 px at the cardiac
+    frequency and nothing is perfused at all.  The decomposition must
+    attribute it to motion, the phase must come out antipodal, and the mask
+    must not claim the field as tissue.
+    """
+    rng = np.random.default_rng(21)
+    rows, cols = np.mgrid[0:H, 0:W]
+    # structured anatomy, so grad(ln I) is large and varied
+    base = (18000.0 + 6000.0 * np.sin(rows / 11.0) * np.cos(cols / 9.0)
+            + 4000.0 * np.exp(-((rows - 60) ** 2 + (cols - 90) ** 2) / 900.0))
+    t = np.arange(N) / FS
+    disp = 0.15 * np.sin(2 * np.pi * F_HR * t)
+
+    frames = np.empty((N, H, W), dtype=np.float32)
+    shifts = {}
+    for i, d in enumerate(disp):
+        key = round(float(d), 3)
+        if key not in shifts:
+            shifts[key] = _shifted(base, key, 0.6 * key)
+        frames[i] = shifts[key]
+    mov = (iot.OFFSET + rng.normal(frames, np.sqrt(iot.GAIN * frames))
+           ).astype(np.float32)
+
+    tm = iot.find_tissue(mov, _ft(), n_frames=N, bin_xy=BIN, verbose=False)
+    fr = tm.frac
+    print(f"  pure rigid motion, nothing perfused:")
+    print(f"    decomposition  {100*fr['uniform']:.0f}% uniform, "
+          f"{100*fr['motion']:.0f}% motion, "
+          f"{100*fr['structured']:.0f}% structured")
+    print(f"    phase moments  m1 {tm.phase_m1:.2f}, m2 {tm.phase_m2:.2f}")
+    print(f"    mask keeps     {100*tm.mask.mean():.0f}% of the frame")
+    assert fr["motion"] > 0.5, fr
+    assert tm.phase_m2 > 2.0 * tm.phase_m1, (tm.phase_m1, tm.phase_m2)
+    assert tm.mask.mean() < 0.35, tm.mask.mean()
+    print("  PASS  test_motion_artefact_is_identified_and_removed")
+
+
+def test_real_perfusion_survives_the_decomposition():
+    """
+    The removal must not cost anything when there is nothing to remove: a
+    clean perfusion field must still be recovered, and must NOT be labelled
+    motion.
+    """
+    mov, truth = synth(seed=31)
+    tm = iot.find_tissue(mov, _ft(), n_frames=N, bin_xy=BIN, verbose=False)
+    tp, fp, fn, recall, fpr = _score(tm.mask, truth)
+    fr = tm.frac
+    print(f"  clean perfusion: {100*fr['uniform']:.0f}% uniform, "
+          f"{100*fr['motion']:.0f}% motion, "
+          f"{100*fr['structured']:.0f}% structured; "
+          f"m1 {tm.phase_m1:.2f} m2 {tm.phase_m2:.2f}")
+    print(f"    recall {100*recall:.0f}%, fpr {100*fpr:.1f}%")
+    assert fr["motion"] < 0.5, fr
+    assert tm.phase_m2 < 2.5 * tm.phase_m1, (tm.phase_m1, tm.phase_m2)
+    assert recall > 0.80, recall
+    assert fpr < 0.08, fpr
+    print("  PASS  test_real_perfusion_survives_the_decomposition")
 
 
 def test_threshold_is_not_a_free_parameter():
@@ -277,5 +346,7 @@ if __name__ == "__main__":
     test_no_pulse_is_not_silently_accepted()
     test_parenchyma_is_recovered_not_just_the_vasculature()
     test_global_detector_uses_the_coherent_mean()
+    test_motion_artefact_is_identified_and_removed()
+    test_real_perfusion_survives_the_decomposition()
     test_threshold_is_not_a_free_parameter()
     print("all passed")

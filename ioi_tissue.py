@@ -128,6 +128,10 @@ class TissueMask:
     n_eff: float = 0.0           # independent pixels actually tested
     global_ratio: float = np.nan  # pulse / noise in the coherent spatial mean
     lit: np.ndarray | None = None  # illuminated, unsaturated field
+    frac: dict = field(default_factory=dict)  # uniform / motion / structured
+    phase_m1: float = np.nan     # 1st circular moment of the cardiac phase
+    phase_m2: float = np.nan     # 2nd -- m2 >> m1 means a motion artefact
+    cardiac_phase: np.ndarray | None = None  # phase at the heart rate
     notes: list = field(default_factory=list)
 
     @property
@@ -137,6 +141,31 @@ class TissueMask:
     @property
     def n_components(self) -> int:
         return int(label(self.mask)[1])
+
+    def _decomposition(self) -> str:
+        """Where the cardiac modulation comes from, and what that implies."""
+        fr = self.frac or {}
+        if not np.isfinite(fr.get("structured", np.nan)):
+            return "  cardiac map         : not decomposed (fallback method)"
+        u, m, s = (100 * fr["uniform"], 100 * fr["motion"],
+                   100 * fr["structured"])
+        verdict = ("MOTION-DOMINATED: the preparation is moving at the heart "
+                   "rate" if (m > 50 or (np.isfinite(self.phase_m2)
+                                         and self.phase_m2 > 2.5 * self.phase_m1
+                                         and self.phase_m2 > 0.4))
+                   else "global term dominates: little spatial contrast to "
+                        "mask on" if u > 70
+                   else "mostly structured: this is perfusion")
+        return ("\n".join([
+            f"  cardiac map is      : {u:.0f}% uniform, {m:.0f}% rigid motion,"
+            f" {s:.0f}% structured",
+            f"                        (motion subtracted; the uniform term is "
+            f"reported only -- it is not identifiable)",
+            f"  phase moments       : m1 {self.phase_m1:.2f}, "
+            f"m2 {self.phase_m2:.2f}  "
+            f"({'ANTIPODAL -> motion' if self.phase_m2 > 2.5 * self.phase_m1 and self.phase_m2 > 0.4 else 'unimodal -> perfusion'})",
+            f"  -> {verdict}",
+        ]))
 
     def summary(self) -> str:
         pct = 100.0 * self.mask.mean()
@@ -152,6 +181,7 @@ class TissueMask:
             f"({self.f_resp * 60:.0f}/min)",
             f"  pulse in the mean   : {self.global_ratio:.1f} x "
             f"(coherent spatial mean over the lit field)",
+            self._decomposition(),
             f"  spatial averaging   : sigma {self.smooth_sigma:g} binned px "
             f"({self.smooth_sigma * self.um_per_pixel:.0f} um) = "
             f"{1/max(k_from_sigma(self.smooth_sigma), 1e-9):.0f} px coherently"
@@ -292,7 +322,101 @@ def _smooth_complex(z, mask, sigma):
     return np.where(good, num / np.where(good, den, 1.0), 0.0 + 0j)
 
 
-def _coherent_statistic(X, sigma, bins, mask, shape, smooth_sigma):
+def _decompose(Z, mean_img, mask, offset=OFFSET):
+    """
+    Split a complex response map into the parts that cannot localise tissue
+    and the part that can.
+
+    A pixel's reflectance can be modulated at the heart rate by three quite
+    different things, and only one of them says "there is perfused cortex
+    HERE":
+
+    UNIFORM.  A fractional change common to the whole field -- a genuinely
+    global haemodynamic term, or any modulation of the light source.  In dR/R
+    units this is a constant.  It carries no spatial information, so it cannot
+    distinguish cortex from cement, and left in it lifts every pixel above
+    threshold at once: a unimodal histogram sitting entirely above the line.
+
+    It is nonetheless NOT removed here, because it is not identifiable.  A
+    signal that is genuinely global and a signal that merely covers most of
+    the field are the same observation.  Fitting a constant to a localised
+    response absorbs part of that response and leaves a negative pedestal
+    everywhere else -- a disc covering 26% of the frame comes back with the
+    background at 26% of the signal amplitude, which destroys exactly the
+    contrast the mask depends on.  So the constant is fitted as a NUISANCE,
+    reported, and left in place; what to do about a large uniform fraction is
+    a judgement about the preparation, not something to subtract away.
+
+    MOTION.  If the preparation moves by d at the heart rate -- a compliant
+    head-plate, ballistocardiographic motion of the animal -- then every pixel
+    records dR/R = -d . grad(ln I).  One global complex displacement explains
+    the whole field, it is largest wherever the image has structure, and its
+    PHASE FLIPS BY 180 DEGREES across every edge, because grad(ln I) does.
+    Nothing about it requires blood in the pixel.
+
+    STRUCTURED.  What is left: a modulation that is large in some places and
+    small in others for reasons not explained by a rigid shift of the image.
+    That is perfusion, and it is the only term that can draw a mask.
+
+    Motion IS identifiable, because it has a shape.  {1, d/dx ln I, d/dy ln I}
+    is fitted with complex coefficients and only the two gradient terms are
+    subtracted -- two degrees of freedom out of twenty thousand pixels.  With
+    no motion the coefficients come out near zero and nothing happens, so this
+    is safe unconditionally.
+
+    Returns (residual, fractions) with fractions giving the share of the map's
+    power explained by each model.
+    """
+    I = np.maximum(np.asarray(mean_img, dtype=float) - offset, 1.0)
+    gy, gx = np.gradient(np.log(I))
+    one = np.ones_like(I)
+
+    z = Z[mask]
+    tot = float(np.sum(np.abs(z) ** 2))
+    if tot <= 0:
+        return np.array(Z, copy=True), {"uniform": 0.0, "motion": 0.0,
+                                        "structured": 1.0}
+
+    def _r2(cols):
+        A = np.column_stack([c[mask] for c in cols])
+        coef, *_ = np.linalg.lstsq(A, z, rcond=None)
+        res = z - A @ coef
+        return 1.0 - float(np.sum(np.abs(res) ** 2)) / tot, coef, A
+
+    r2_u, _, _ = _r2([one])
+    r2_m, _, _ = _r2([gx, gy])
+    r2_b, coef, _ = _r2([one, gx, gy])
+
+    # subtract the motion terms ONLY; the constant was a nuisance regressor so
+    # that a global offset could not bias the displacement estimate
+    fit = coef[1] * gx + coef[2] * gy
+    residual = np.where(mask, Z - fit, 0.0)
+    return residual, {"uniform": float(r2_u), "motion": float(r2_m),
+                      "explained": float(r2_b),
+                      "structured": float(max(1.0 - r2_b, 0.0))}
+
+
+def phase_axiality(Z, mask):
+    """
+    Is the response phase unimodal or antipodal?
+
+    Perfusion arrives with roughly one phase across the field.  A rigid motion
+    artefact arrives with TWO phases 180 degrees apart, because the sign of
+    grad(ln I) flips across every edge.  The first circular moment collapses
+    for such a distribution while the second survives, so m2 >> m1 is a motion
+    signature that uses nothing but the data.
+    """
+    w = np.abs(Z[mask])
+    p = np.angle(Z[mask])
+    s = float(w.sum())
+    if s <= 0:
+        return 0.0, 0.0
+    m1 = float(np.abs(np.sum(w * np.exp(1j * p)) / s))
+    m2 = float(np.abs(np.sum(w * np.exp(2j * p)) / s))
+    return m1, m2
+
+
+def _coherent_statistic(maps, sigma, mask, shape, smooth_sigma):
     """
     Spatially averaged detection statistic at known DFT bins.
 
@@ -331,9 +455,8 @@ def _coherent_statistic(X, sigma, bins, mask, shape, smooth_sigma):
     var = np.where(good, var / np.where(good, den ** 2, 1.0), np.nan)
 
     S = np.zeros(shape)
-    for b in bins:
-        zs = _smooth_complex(np.asarray(X[b]).reshape(shape), mask,
-                             smooth_sigma)
+    for z in maps:
+        zs = _smooth_complex(np.asarray(z).reshape(shape), mask, smooth_sigma)
         with np.errstate(invalid="ignore", divide="ignore"):
             S = S + np.abs(zs) ** 2 / var
     return S, np.sqrt(var), k
@@ -508,25 +631,52 @@ def find_tissue(mov, ft, start=None, n_frames=3000, bin_xy=4,
                                      (f < PULSE_BAND[1])).sum()), 1,
                                 expected_false=0.01)
 
-    # ---- the statistic ---------------------------------------------------
-    if g_ratio >= g_thr:
-        method = "cardiac"
-        # The heart rate belongs to the ANIMAL, so every pixel is interrogated
-        # at the same DFT bin.  No per-pixel search means no search penalty.
+    # ---- diagnose the map at the heart rate, whatever we do with it ------
+    # The heart rate belongs to the ANIMAL, so every pixel is interrogated at
+    # the same DFT bin.  No per-pixel search means no search penalty.
+    frac = {"uniform": np.nan, "motion": np.nan, "explained": np.nan,
+            "structured": np.nan}
+    phase_m1 = phase_m2 = np.nan
+    bins, raw_maps, maps = [], [], []
+    if np.isfinite(f_pulse):
         i_hr = int(np.argmin(np.abs(f - f_pulse)))
         bins = [i_hr]
         for h in range(2, n_harmonics + 1):
             j = int(np.argmin(np.abs(f - f_pulse * h)))
             if f[j] < f[-1] and j != i_hr:
                 bins.append(j)
-        S, sig_s, k_eff = _coherent_statistic(X, sigma, bins, lit,
+        raw_maps = [np.asarray(X[b]).reshape(mean_img.shape) for b in bins]
+        phase_m1, phase_m2 = phase_axiality(raw_maps[0], lit)
+        for zm in raw_maps:
+            res, fr = _decompose(zm, mean_img, lit)
+            maps.append(res)
+            if frac["structured"] != frac["structured"]:   # first one only
+                frac = fr
+
+    motion_led = np.isfinite(frac["motion"]) and frac["motion"] > 0.5
+    if motion_led:
+        notes.append(
+            f"{100*frac['motion']:.0f}% of the map at the heart rate is "
+            f"explained by a RIGID SHIFT of the image (phase moments m1 "
+            f"{phase_m1:.2f} / m2 {phase_m2:.2f}).  The preparation is moving "
+            f"at the heart rate; that modulates every pixel with an intensity "
+            f"gradient whether or not it contains blood.  It has been "
+            f"subtracted, but a mask built on what is left is only as good as "
+            f"that subtraction -- check the head fixation.")
+
+    # ---- the statistic ---------------------------------------------------
+    # A pure motion artefact has a near-zero COHERENT spatial mean, because
+    # grad(ln I) averages out over the field, so it can fail the global test
+    # while dominating every individual pixel.  Take the known-frequency path
+    # in that case too: it is the only one that can subtract the motion.
+    if maps and (g_ratio >= g_thr or motion_led):
+        method = "cardiac"
+        S, sig_s, k_eff = _coherent_statistic(maps, sigma, lit,
                                               mean_img.shape, smooth_sigma)
         n_eff = max(float(lit.sum()) * k_eff, 1.0)
         thr = _gamma_threshold(len(bins), n_eff, expected_false)
         ratio = np.sqrt(np.maximum(S, 0.0))
-        pulse_amp = (np.abs(_smooth_complex(
-            X[i_hr].reshape(mean_img.shape), lit, smooth_sigma))
-            if np.isfinite(f_pulse) else np.zeros(mean_img.shape))
+        pulse_amp = np.abs(_smooth_complex(maps[0], lit, smooth_sigma))
     else:
         method = "cardiac_band"
         notes.append(f"no cardiac peak in the spatial mean "
@@ -581,13 +731,30 @@ def find_tissue(mov, ft, start=None, n_frames=3000, bin_xy=4,
     # frame could be brain.  A mask that is a small fraction of it, and in
     # several thin pieces, is a sensitivity failure rather than a small
     # window -- say so, with the lever that fixes it.
-    frac = mask.sum() / max(lit.sum(), 1)
+    cover = mask.sum() / max(lit.sum(), 1)
     n_pieces = int(label(mask)[1])
-    if method != "excess_var" and (frac < 0.15 or
-                                   (n_pieces > 3 and frac < 0.3)):
+
+    # The opposite failure to the one below: a mask that keeps most of the
+    # field.  Brain sits under the whole mouse skull and 625 nm goes through
+    # bone, so "has a pulse" is true nearly everywhere; what should vary is
+    # how MUCH, and if it does not, the statistic is dominated by something
+    # that is the same everywhere.
+    if method == "cardiac" and cover > 0.6:
+        notes.append(
+            f"the mask keeps {100*cover:.0f}% of the illuminated field.  "
+            f"After removing the uniform and motion terms, "
+            f"{100*frac['structured']:.0f}% of the cardiac map is structured, "
+            f"so the contrast that remains is {'real but weak' if frac['structured'] > 0.3 else 'very thin'}.  "
+            f"625 nm penetrates mouse skull and there is perfused cortex "
+            f"under all of it, so a pulse mask marks BRAIN, not the window.  "
+            f"If you need the window specifically, that is an optical "
+            f"criterion, not a physiological one.")
+
+    if method != "excess_var" and (cover < 0.15 or
+                                   (n_pieces > 3 and cover < 0.3)):
         gain = 1.0 / np.sqrt(max(k_from_sigma(smooth_sigma), 1e-9))
         notes.append(
-            f"the mask covers only {100*frac:.0f}% of the illuminated field, "
+            f"the mask covers only {100*cover:.0f}% of the illuminated field, "
             f"in {n_pieces} piece(s).  That is the signature of thresholding "
             f"the vasculature rather than the tissue: the pulse clears "
             f"threshold over surface vessels and not over parenchyma.  "
@@ -602,7 +769,11 @@ def find_tissue(mov, ft, start=None, n_frames=3000, bin_xy=4,
                     mean_img=mean_img, method=method, n_frames=n, fs=float(fs),
                     bin_xy=int(bin_xy), um_per_pixel=float(um_per_pixel),
                     smooth_sigma=float(smooth_sigma), n_eff=float(n_eff),
-                    global_ratio=float(g_ratio), lit=lit, notes=notes)
+                    global_ratio=float(g_ratio), lit=lit, frac=frac,
+                    phase_m1=float(phase_m1), phase_m2=float(phase_m2),
+                    cardiac_phase=(np.angle(raw_maps[0]) if raw_maps
+                                   else None),
+                    notes=notes)
     return tm
 
 
@@ -619,7 +790,10 @@ def save(tm: TissueMask, path: str = DEFAULT_PATH):
         mean_img=tm.mean_img, method=tm.method, n_frames=tm.n_frames,
         fs=tm.fs, bin_xy=tm.bin_xy, um_per_pixel=tm.um_per_pixel,
         smooth_sigma=tm.smooth_sigma, n_eff=tm.n_eff,
-        global_ratio=tm.global_ratio,
+        global_ratio=tm.global_ratio, phase_m1=tm.phase_m1,
+        phase_m2=tm.phase_m2, frac=np.array(tm.frac, dtype=object),
+        cardiac_phase=(tm.cardiac_phase if tm.cardiac_phase is not None
+                       else np.zeros_like(tm.ratio)),
         lit=(tm.lit if tm.lit is not None else np.zeros_like(tm.mask)),
         notes=np.array(tm.notes, dtype=object), source=np.array(ioi.DAT_PATH),
     )
@@ -667,6 +841,11 @@ def load(path: str = DEFAULT_PATH, shape=None, bin_xy=None,
         global_ratio=float(z["global_ratio"]) if "global_ratio" in z.files
         else np.nan,
         lit=z["lit"] if "lit" in z.files else None,
+        phase_m1=float(z["phase_m1"]) if "phase_m1" in z.files else np.nan,
+        phase_m2=float(z["phase_m2"]) if "phase_m2" in z.files else np.nan,
+        frac=(z["frac"].item() if "frac" in z.files else {}),
+        cardiac_phase=(z["cardiac_phase"] if "cardiac_phase" in z.files
+                       else None),
         notes=[str(x) for x in np.atleast_1d(z["notes"])] if "notes" in z.files
         else [],
     )
